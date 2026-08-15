@@ -13,7 +13,7 @@ if ! uci -q get podkop_sub.config >/dev/null 2>&1; then
 		set podkop_sub.config.section='main'
 		set podkop_sub.config.deduplicate='1'
 		set podkop_sub.config.preserve_manual='1'
-		set podkop_sub.config.cron='0'
+		set podkop_sub.config.cron='24'
 		set podkop_sub.config.user_agent='v2rayNG/1.9.5'
 		set podkop_sub.config.last_status=''
 		set podkop_sub.config.last_message=''

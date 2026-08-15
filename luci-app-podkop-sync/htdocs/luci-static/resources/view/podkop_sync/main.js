@@ -148,6 +148,14 @@ return view.extend({
 			  'По одной ссылке в строке.'));
 		o.placeholder = 'https://example.com/sub';
 
+		o = s.option(form.TextValue, 'manual_nodes', _('Ручные ноды (vless://)'),
+			_('Вставьте свои серверы, по одной ссылке vless:// в строке — они ' +
+			  'добавляются в секцию наравне с нодами подписки и не затираются ' +
+			  'при обновлении. Строки без vless:// игнорируются.'));
+		o.rows = 6;
+		o.monospace = true;
+		o.placeholder = 'vless://uuid@host:443?type=tcp&security=reality&...#Имя';
+
 		o = s.option(form.ListValue, 'section', _('Целевая секция Podkop'),
 			_('Ноды пишутся в urltest_proxy_links выбранной секции.'));
 		if (sections.length === 0) o.value('main', 'main');
@@ -157,10 +165,9 @@ return view.extend({
 		o = s.option(form.Flag, 'deduplicate', _('Удалять дубликаты серверов'));
 		o.default = '1';
 
-		o = s.option(form.Flag, 'preserve_manual', _('Сохранять ноды, добавленные вручную'),
-			_('При обновлении заменяются только ноды, добавленные плагином; ' +
-			  'ноды, которые вы добавили в секцию руками, сохраняются. ' +
-			  'Выкл — очищать весь список.'));
+		o = s.option(form.Flag, 'preserve_manual', _('Сохранять внешние ноды'),
+			_('Сохранять ноды, добавленные в секцию напрямую в podkop (не через ' +
+			  'поле выше). Выкл — секция = только ручные ноды из поля + подписка.'));
 		o.default = '1';
 		o.rmempty = false;
 
@@ -170,7 +177,7 @@ return view.extend({
 		o.value('6', _('Каждые 6 часов'));
 		o.value('12', _('Каждые 12 часов'));
 		o.value('24', _('Раз в сутки'));
-		o.default = '0';
+		o.default = '24';
 
 		o = s.option(form.Value, 'user_agent', _('User-Agent'),
 			_('Отправляется curl при скачивании подписок.'));

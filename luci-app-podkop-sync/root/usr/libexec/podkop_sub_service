@@ -50,8 +50,9 @@ load_cfg() {
 	config_get SECTION      config section         "main"
 	config_get DEDUP        config deduplicate      "1"
 	config_get PRESERVE     config preserve_manual  "1"
-	config_get CRON         config cron            "0"
+	config_get CRON         config cron            "24"
 	config_get USER_AGENT   config user_agent      "v2rayNG/1.9.5"
+	config_get MANUAL       config manual_nodes    ""
 	config_list_foreach config url add_url
 }
 
@@ -146,26 +147,47 @@ cmd_sync() {
 		fi
 	fi
 
+	# --- «наши» ноды: ручные из поля manual_nodes + ноды подписки ------------
+	local ourlinks="$TMPDIR/our.txt"
+	: > "$ourlinks"
+	local mcount=0
+	# ручные ноды: по одной vless:// в строке, пробелы обрезаем, мусор пропускаем
+	printf '%s' "$MANUAL" | tr -d '\r' > "$TMPDIR/manual_raw.txt"
+	while IFS= read -r ml || [ -n "$ml" ]; do
+		ml=$(printf '%s' "$ml" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+		case "$ml" in
+			vless://*) printf '%s\n' "$ml" >> "$ourlinks"; mcount=$((mcount + 1)) ;;
+		esac
+	done < "$TMPDIR/manual_raw.txt"
+	# ноды подписки
+	cat "$links" >> "$ourlinks"
+	# убрать точные дубли внутри наших нод (ручные vs подписка), ручные важнее
+	: > "$TMPDIR/our_d.txt"
+	while IFS= read -r line; do
+		[ -n "$line" ] || continue
+		grep -qxF "$line" "$TMPDIR/our_d.txt" && continue
+		printf '%s\n' "$line" >> "$TMPDIR/our_d.txt"
+	done < "$ourlinks"
+	mv "$TMPDIR/our_d.txt" "$ourlinks"
+
 	# --- запись в podkop -------------------------------------------------
 	local mf="$(managed_file "$SECTION")"
 	local keep="$TMPDIR/keep.txt"
 	: > "$keep"
-	local manual=0
+	local kept=0
 
 	if [ "$PRESERVE" = "1" ]; then
-		# сохраняем всё, что НЕ было добавлено нами в прошлый раз (ручные ноды).
-		# Если реестра ещё нет (первый синк) — считаем ручными ВСЕ текущие ноды,
-		# то есть ничего чужого не удаляем.
+		# сохраняем ноды секции, добавленные НЕ нами (внешние — напрямую в podkop).
+		# Реестр хранит наши прошлые ссылки; чего нет ни в реестре, ни в наших
+		# текущих нодах — считаем внешним и сохраняем.
 		for l in $(uci -q get "podkop.$SECTION.urltest_proxy_links" 2>/dev/null); do
-			if [ -f "$mf" ] && grep -qxF "$l" "$mf"; then
-				continue
-			fi
-			printf '%s\n' "$l" >> "$keep"; manual=$((manual + 1))
+			[ -f "$mf" ] && grep -qxF "$l" "$mf" && continue
+			grep -qxF "$l" "$ourlinks" && continue
+			printf '%s\n' "$l" >> "$keep"; kept=$((kept + 1))
 		done
 	fi
 
 	uci -q delete "podkop.$SECTION.urltest_proxy_links"
-	# сначала ручные, затем ноды подписки (без точных дублей)
 	while IFS= read -r line; do
 		[ -n "$line" ] && uci add_list "podkop.$SECTION.urltest_proxy_links=$line"
 	done < "$keep"
@@ -173,29 +195,29 @@ cmd_sync() {
 		[ -n "$line" ] || continue
 		grep -qxF "$line" "$keep" && continue
 		uci add_list "podkop.$SECTION.urltest_proxy_links=$line"
-	done < "$links"
+	done < "$ourlinks"
 
 	if ! uci commit podkop; then
-		set_status "error" "Не удалось сохранить podkop (uci commit)" "$count"
+		set_status "error" "Не удалось сохранить podkop (uci commit)" ""
 		log err "uci commit podkop failed"
 		uci -q revert podkop
 		rm -rf "$TMPDIR"
 		return 1
 	fi
 
-	# обновляем реестр управляемых ссылок (ноды подписки этой секции)
+	# реестр = наши ноды (ручные из поля + подписка)
 	mkdir -p "$MANAGED_DIR"
-	cp "$links" "$mf"
+	cp "$ourlinks" "$mf"
 
 	podkop reload >/dev/null 2>&1 || podkop restart >/dev/null 2>&1
 
-	local total=$((count + manual))
+	local total=$((count + mcount + kept))
 	if [ "$nosub" = 1 ]; then
-		set_status "ok" "Подписок нет: ноды подписки удалены, вручную сохранено: $manual" "$total"
+		set_status "ok" "Без подписки. Вручную: $mcount, внешних: $kept, всего: $total" "$total"
 	else
-		set_status "ok" "Из подписки: $count, вручную сохранено: $manual, всего: $total" "$total"
+		set_status "ok" "Из подписки: $count, вручную: $mcount, внешних: $kept, всего: $total" "$total"
 	fi
-	log info "sync ok: $count sub + $manual manual = $total nodes in section '$SECTION'"
+	log info "sync ok: sub=$count manual=$mcount external=$kept total=$total in '$SECTION'"
 	rm -rf "$TMPDIR"
 	return 0
 }

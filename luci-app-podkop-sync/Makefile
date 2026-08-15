@@ -20,8 +20,9 @@ LUCI_PKGARCH:=all
 define Package/luci-app-podkop-sync/prerm
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT}" ] && exit 0
+# disable only — сервис демона не держит (procd reload-триггер), поэтому
+# 'stop' лишь дёргает 'ubus service delete' и шумит 'Not found' при удалении.
 /etc/init.d/podkop_sub disable 2>/dev/null
-/etc/init.d/podkop_sub stop 2>/dev/null
 sed -i '/# podkop_sub_sync/d' /etc/crontabs/root 2>/dev/null
 /etc/init.d/cron restart 2>/dev/null
 rm -rf /etc/podkop_sub.managed.d

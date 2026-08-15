@@ -46,21 +46,6 @@ function fmtTime(epoch) {
 	return new Date(epoch * 1000).toLocaleString();
 }
 
-/* Ждём, пока LuCI реально закоммитит изменения (uci.changes станет пустым),
-   чтобы sync читал уже применённый конфиг. tries — максимум попыток по 300мс. */
-function waitApplied(tries) {
-	return uci.changes().then(function(ch) {
-		var has = false, k;
-		for (k in (ch || {})) {
-			if (ch[k] && ch[k].length) { has = true; break; }
-		}
-		if (!has || tries <= 0)
-			return true;
-		return new Promise(function(res) { window.setTimeout(res, 300); })
-			.then(function() { return waitApplied(tries - 1); });
-	});
-}
-
 function renderStatusInner(st) {
 	st = st || {};
 	var ok = (st.status === 'ok');
@@ -189,13 +174,21 @@ return view.extend({
 
 		function onSyncNow() {
 			var self = this;
-			/* Штатное сохранение+применение (корректно гасит бейдж «unsaved» и
-			   не падает при отсутствии изменений), затем ЖДЁМ фактического
-			   commit'а и только потом синкаем — иначе sync читает старый конфиг
-			   (баг «срабатывает со второго раза»). */
-			return self.handleSaveApply(null, '0').then(function() {
-				return waitApplied(15);
+			/* Сохраняем форму в uci-сессию и ДОЖИДАЕМСЯ настоящего commit'а
+			   (промис uci.apply() резолвится после записи в /etc/config), и только
+			   потом синкаем — иначе sync читает старый конфиг (баг «со второго
+			   раза»). uci.apply() зовём только при наличии изменений, иначе он
+			   отвечает "code 5: No data received". После — освежаем бейдж. */
+			return self.handleSave(null).then(function() {
+				return uci.changes();
+			}).then(function(ch) {
+				var has = false, k;
+				for (k in (ch || {})) {
+					if (ch[k] && ch[k].length) { has = true; break; }
+				}
+				return has ? uci.apply() : null;
 			}).then(function() {
+				try { ui.changes.renderChangeIndicator(); } catch (e) {}
 				ui.showModal(_('Обновление подписок…'), [
 					E('p', { 'class': 'spinning' }, _('Скачивание и разбор, подождите…'))
 				]);

@@ -1,0 +1,64 @@
+name: build-ipk
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write        # нужно для публикации Release
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Xiaomi Mi Router AX3000T — MediaTek MT7981B (mediatek/filogic).
+          # Пакет PKGARCH=all — один .ipk ставится на любой 24.10.x,
+          # поэтому берём rolling-тег ветки, а не конкретный минор.
+          - arch: aarch64_cortex-a53
+            sdk: 24.10-SNAPSHOT
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build package (OpenWrt SDK)
+        uses: openwrt/gh-action-sdk@main
+        env:
+          ARCH: ${{ matrix.arch }}-${{ matrix.sdk }}
+          FEEDNAME: podkop_sync_ci
+          # имя каталога пакета внутри временного фида = имя репозитория
+          PACKAGES: luci-app-podkop-sync
+          NO_REFRESH_CHECK: 1
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p artifacts
+          find bin/ -name '*.ipk' -exec cp -v {} artifacts/ \; || true
+          find bin/ -name '*.apk' -exec cp -v {} artifacts/ \; || true
+          ls -l artifacts/
+          # стабильное имя ассета для install.sh (releases/download/latest/...)
+          ipk="$(find artifacts -name 'luci-app-podkop-sync*.ipk' | head -1)"
+          [ -n "$ipk" ] && cp -v "$ipk" artifacts/luci-app-podkop-sync.ipk
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: luci-app-podkop-sync-${{ matrix.arch }}
+          path: artifacts/*
+          if-no-files-found: error
+
+      # Публикуем rolling-релиз 'latest' со стабильным именем .ipk,
+      # чтобы install.sh качал его по постоянному URL.
+      - name: Publish rolling release 'latest'
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: latest
+          prerelease: true
+          files: artifacts/luci-app-podkop-sync.ipk

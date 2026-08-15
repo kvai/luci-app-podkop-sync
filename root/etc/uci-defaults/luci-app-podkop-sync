@@ -1,0 +1,39 @@
+#!/bin/sh
+# uci-defaults: первичная инициализация luci-app-podkop-sync.
+# Выполняется один раз при установке пакета, затем удаляется.
+
+# гарантировать наличие конфига плагина
+if [ ! -f /etc/config/podkop_sub ]; then
+	touch /etc/config/podkop_sub
+fi
+if ! uci -q get podkop_sub.config >/dev/null 2>&1; then
+	uci -q batch <<-EOF
+		set podkop_sub.config=podkop_sub
+		set podkop_sub.config.enabled='1'
+		set podkop_sub.config.section='main'
+		set podkop_sub.config.deduplicate='1'
+		set podkop_sub.config.preserve_manual='1'
+		set podkop_sub.config.cron='0'
+		set podkop_sub.config.user_agent='v2rayNG/1.9.5'
+		set podkop_sub.config.last_status=''
+		set podkop_sub.config.last_message=''
+		set podkop_sub.config.last_update='0'
+		set podkop_sub.config.last_count='0'
+		commit podkop_sub
+	EOF
+fi
+
+# включить служебный init-скрипт (procd reload-триггер для cron)
+if [ -x /etc/init.d/podkop_sub ]; then
+	/etc/init.d/podkop_sub enable
+	/etc/init.d/podkop_sub start
+fi
+
+# синхронизировать cron с текущей настройкой
+[ -x /usr/libexec/podkop_sub_service ] && /usr/libexec/podkop_sub_service update_cron
+
+# перечитать ACL/меню LuCI
+rm -f /tmp/luci-indexcache /tmp/luci-modulecache/* 2>/dev/null
+/etc/init.d/rpcd reload >/dev/null 2>&1
+
+exit 0

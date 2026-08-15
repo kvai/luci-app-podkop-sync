@@ -1,0 +1,31 @@
+#!/bin/sh
+# rpcd-провайдер ubus-объекта luci.podkop_sub для фронтенда LuCI.
+# Тонкая обёртка над /usr/libexec/podkop_sub_service — вся логика там.
+
+SVC="/usr/libexec/podkop_sub_service"
+
+case "$1" in
+	list)
+		# объявляем методы (без обязательных аргументов — конфиг читается из UCI)
+		echo '{ "sync": {}, "status": {}, "update_cron": {} }'
+		;;
+	call)
+		case "$2" in
+			sync)
+				# запускаем синхронизацию и возвращаем свежий статус+ноды
+				"$SVC" sync >/dev/null 2>&1
+				"$SVC" status
+				;;
+			status)
+				"$SVC" status
+				;;
+			update_cron)
+				"$SVC" update_cron >/dev/null 2>&1
+				echo '{ "ok": true }'
+				;;
+			*)
+				echo '{ "error": "unknown method" }'
+				;;
+		esac
+		;;
+esac

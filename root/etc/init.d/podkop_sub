@@ -1,0 +1,23 @@
+#!/bin/sh /etc/rc.common
+# Служебный init-скрипт: держит cron-задачу синхронизации в соответствии
+# с конфигом podkop_sub. Демона не запускает — только реагирует на изменения
+# конфига (procd reload trigger) и на загрузку системы.
+
+USE_PROCD=1
+START=95
+
+# Пусто: строка cron persistent (лежит в /etc/crontabs/root, переживает
+# ребут), поэтому boot-реконсиляция не нужна. Главное — не вызывать здесь
+# вложенные init.d (cron restart), иначе ломается регистрация procd-триггеров.
+start_service() {
+	return 0
+}
+
+reload_service() {
+	# срабатывает после `uci commit podkop_sub` + apply (в т.ч. из LuCI)
+	/usr/libexec/podkop_sub_service update_cron
+}
+
+service_triggers() {
+	procd_add_reload_trigger "podkop_sub"
+}

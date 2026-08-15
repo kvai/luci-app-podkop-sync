@@ -1,0 +1,17 @@
+{
+	"luci-app-podkop-sync": {
+		"description": "Grant access to Podkop Sync",
+		"read": {
+			"ubus": {
+				"luci.podkop_sub": [ "status", "sync", "update_cron" ]
+			},
+			"uci": [ "podkop_sub", "podkop" ]
+		},
+		"write": {
+			"ubus": {
+				"luci.podkop_sub": [ "sync", "update_cron" ]
+			},
+			"uci": [ "podkop_sub", "podkop" ]
+		}
+	}
+}

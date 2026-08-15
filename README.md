@@ -16,27 +16,27 @@
 
 ## Компоненты
 
-| Путь | Назначение |
-|------|-----------|
-| `root/usr/bin/podkop_sync.py` | Парсер подписок → `vless://` (stdlib only, без `urllib`). |
-| `root/usr/libexec/podkop_sub_service` | Бэкенд: `sync` / `update_cron` / `status`; curl, fail-safe, uci, cron. |
-| `root/usr/libexec/rpcd/luci.podkop_sub` | rpcd-провайдер ubus для фронтенда. |
-| `root/usr/share/rpcd/acl.d/…json` | ACL-права LuCI. |
-| `root/usr/share/luci/menu.d/…json` | Пункт меню *Services → Podkop Sync*. |
-| `root/etc/config/podkop_sub` | UCI-конфиг плагина. |
-| `root/etc/init.d/podkop_sub` | procd-сервис: reload-триггер, пересобирает cron при изменении конфига. |
-| `htdocs/luci-static/resources/view/podkop_sync/main.js` | Фронтенд (LuCI JS API). |
+| Путь                                                    | Назначение                                                             |
+| ------------------------------------------------------- | ---------------------------------------------------------------------- |
+| `root/usr/bin/podkop_sync.py`                           | Парсер подписок → `vless://` (stdlib only, без `urllib`).              |
+| `root/usr/libexec/podkop_sub_service`                   | Бэкенд: `sync` / `update_cron` / `status`; curl, fail-safe, uci, cron. |
+| `root/usr/libexec/rpcd/luci.podkop_sub`                 | rpcd-провайдер ubus для фронтенда.                                     |
+| `root/usr/share/rpcd/acl.d/…json`                       | ACL-права LuCI.                                                        |
+| `root/usr/share/luci/menu.d/…json`                      | Пункт меню _Services → Podkop Sync_.                                   |
+| `root/etc/config/podkop_sub`                            | UCI-конфиг плагина.                                                    |
+| `root/etc/init.d/podkop_sub`                            | procd-сервис: reload-триггер, пересобирает cron при изменении конфига. |
+| `htdocs/luci-static/resources/view/podkop_sync/main.js` | Фронтенд (LuCI JS API).                                                |
 
 ## Установка одной командой
 
 На роутере (busybox ash не умеет `sh <(...)`, поэтому через пайп):
 
 ```sh
-wget -O - https://raw.githubusercontent.com/OWNER/luci-app-podkop-sync/main/install.sh | sh
+wget -O - https://raw.githubusercontent.com/kvai/luci-app-podkop-sync/main/install.sh | sh
 ```
 
 `install.sh` качает готовый `.ipk` из GitHub Release `latest` и ставит через
-`opkg` (зависимости подтянутся сами). Замени `OWNER` на свой логин.
+`opkg` (зависимости подтянутся сами).
 
 > **Публичный vs приватный.** Анонимный one-liner работает только с **публичным**
 > репозиторием (raw-скрипт и Release-ассеты). Для **приватного** нужен токен
@@ -83,8 +83,8 @@ opkg update && opkg install python3-light
 
 # --- с рабочей машины (замените IP роутера) ---
 R=192.168.1.1
-scp -O -r root/* root@$R:/
-scp -O -r htdocs/luci-static root@$R:/www/
+scp -O -r luci-app-podkop-sync/root/* root@$R:/
+scp -O -r luci-app-podkop-sync/htdocs/luci-static root@$R:/www/
 
 # --- на роутере: права, инициализация, сервис cron ---
 ssh -o RemoteCommand=none root@$R '

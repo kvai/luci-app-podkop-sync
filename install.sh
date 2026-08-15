@@ -3,16 +3,16 @@
 # Качает готовый .ipk из GitHub Release 'latest' и ставит через opkg.
 #
 # Использование (на роутере):
-#   wget -O - https://raw.githubusercontent.com/OWNER/REPO/main/install.sh | sh
+#   wget -O - https://raw.githubusercontent.com/kvai/luci-app-podkop-sync/main/install.sh | sh
 #
 # Приватный репозиторий: передай токен с правом contents:read через env GH_TOKEN:
 #   GH_TOKEN=ghp_xxx sh -c 'wget -O - --header="Authorization: token '"$GH_TOKEN"'" \
-#     https://raw.githubusercontent.com/OWNER/REPO/main/install.sh | GH_TOKEN=ghp_xxx sh'
+#     https://raw.githubusercontent.com/kvai/luci-app-podkop-sync/main/install.sh | GH_TOKEN=ghp_xxx sh'
 
 set -e
 
 # ─── настрой под свой репозиторий ──────────────────────────────────────────
-REPO="OWNER/luci-app-podkop-sync"
+REPO="kvai/luci-app-podkop-sync"
 TAG="latest"
 ASSET="luci-app-podkop-sync.ipk"
 # ───────────────────────────────────────────────────────────────────────────

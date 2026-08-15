@@ -8,7 +8,7 @@ import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-MOD = os.path.join(HERE, "..", "root", "usr", "bin", "podkop_sync.py")
+MOD = os.path.join(HERE, "..", "luci-app-podkop-sync", "root", "usr", "bin", "podkop_sync.py")
 
 spec = importlib.util.spec_from_file_location("podkop_sync", MOD)
 ps = importlib.util.module_from_spec(spec)

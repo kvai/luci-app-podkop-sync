@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
 .DS_Store
-bin/
+# OpenWrt build output (repo root only) — anchored so it doesn't match root/usr/bin/
+/bin/
 vless_links.txt

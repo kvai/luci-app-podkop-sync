@@ -67,7 +67,12 @@ var PKS_CSS =
 	'.pks-r{text-align:right}' +
 	'.pks-mono{font-family:monospace;opacity:.85}' +
 	'.pks-chip{font-family:monospace;font-size:11px;opacity:.85;background:rgba(128,128,128,.15);border:1px solid rgba(128,128,128,.28);border-radius:4px;padding:1px 6px;white-space:nowrap}' +
-	'.pks-dot{width:8px;height:8px;border-radius:50%;display:inline-block;vertical-align:middle;margin-right:7px}';
+	'.pks-dot{width:8px;height:8px;border-radius:50%;display:inline-block;vertical-align:middle;margin-right:7px}' +
+	'.pks-set{margin-top:1.2rem;border-top:1px solid rgba(128,128,128,.22);padding-top:.3rem}' +
+	'.pks-set>summary{cursor:pointer;font-size:15px;font-weight:500;padding:8px 0;list-style:none}' +
+	'.pks-set>summary::-webkit-details-marker{display:none}' +
+	'.pks-set>summary::before{content:"\\25B8\\00A0";opacity:.6}' +
+	'.pks-set[open]>summary::before{content:"\\25BE\\00A0"}';
 
 function pksTile(label, val) {
 	return E('div', { 'class': 'pks-tile' }, [
@@ -172,9 +177,9 @@ return view.extend({
 		});
 
 		/* ---- форма настроек (нативный LuCI, даёт Save & Apply) ---- */
-		var m = new form.Map('podkop_sub', _('Podkop Sync'),
-			_('Скачивает подписки на прокси, разбирает их в vless-ссылки и применяет ' +
-			  'к секции Podkop (режим URLTest).'));
+		/* без заголовка/описания у самой формы — свой компактный заголовок сверху,
+		   а всю форму прячем в сворачиваемую секцию «Настройки» */
+		var m = new form.Map('podkop_sub');
 
 		var s = m.section(form.NamedSection, 'config', 'podkop_sub');
 		s.anonymous = true;
@@ -273,20 +278,27 @@ return view.extend({
 
 		var extra = E('div', { 'class': 'cbi-section' }, [
 			E('style', {}, PKS_CSS),
+			E('h2', { 'style': 'margin:0 0 2px' }, 'Podkop Sync'),
+			E('p', { 'class': 'pks-cap' },
+				_('Скачивает подписки, разбирает в vless-ссылки и применяет к секции podkop (URLTest).')),
 			E('p', {}, [
 				E('button', {
 					'class': 'btn cbi-button cbi-button-apply',
 					'click': ui.createHandlerFn(this, onSyncNow)
 				}, _('Обновить сейчас')),
 				E('span', { 'style': 'margin-left:1em;opacity:.7' },
-					_('Сохраняет настройки выше и сразу обновляет.'))
+					_('Сохраняет настройки и сразу обновляет.'))
 			]),
 			statusBox,
 			nodesBox
 		]);
 
 		return m.render().then(function(mapEl) {
-			return E('div', {}, [ mapEl, extra ]);
+			var settings = E('details', { 'class': 'pks-set' }, [
+				E('summary', {}, _('Настройки')),
+				mapEl
+			]);
+			return E('div', {}, [ extra, settings ]);
 		});
 	}
 });

@@ -58,6 +58,12 @@ var PKS_CSS =
 	'.pks-bar .t{font-size:15px;font-weight:500}' +
 	'.pks-pill{font-size:12px;opacity:.85;background:rgba(128,128,128,.15);border-radius:20px;padding:2px 9px}' +
 	'.pks-flt{margin-left:auto}' +
+	'.pks-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin:.2rem 0 1.1rem}' +
+	'.pks-head h2{margin:0}' +
+	'.pks-card{border:1px solid rgba(128,128,128,.2);border-radius:10px;background:rgba(128,128,128,.04);padding:14px 16px;margin:0 0 14px}' +
+	'.pks-card>.pks-bar{border-bottom:1px solid rgba(128,128,128,.2);padding-bottom:10px;margin:0 0 4px}' +
+	'.pks-card .pks-tiles{margin:0 0 .5rem}' +
+	'.pks-card>.pks-cap:last-child{margin:0}' +
 	'.pks-wrap{border:1px solid rgba(128,128,128,.28);border-radius:8px;overflow:hidden}' +
 	'.pks-scroll{max-height:360px;overflow:auto}' +
 	'.pks-tbl{width:100%;border-collapse:collapse;font-size:13px}' +
@@ -72,7 +78,20 @@ var PKS_CSS =
 	'.pks-set>summary{cursor:pointer;font-size:15px;font-weight:500;padding:8px 0;list-style:none}' +
 	'.pks-set>summary::-webkit-details-marker{display:none}' +
 	'.pks-set>summary::before{content:"\\25B8\\00A0";opacity:.6}' +
-	'.pks-set[open]>summary::before{content:"\\25BE\\00A0"}';
+	'.pks-set[open]>summary::before{content:"\\25BE\\00A0"}' +
+	/* мягкая стилизация нативной формы CBI — только внутри .pks-set */
+	'.pks-form .cbi-section-node{background:rgba(128,128,128,.06);border:1px solid rgba(128,128,128,.2);border-radius:8px;padding:2px 14px;margin-top:.4rem}' +
+	'.pks-form .cbi-value{padding:12px 2px;border-bottom:1px solid rgba(128,128,128,.14);margin:0}' +
+	'.pks-form .cbi-section-node>div:last-child .cbi-value,.pks-form .cbi-value:last-child{border-bottom:0}' +
+	'.pks-form .cbi-value-title{font-weight:500;opacity:.9}' +
+	'.pks-form .cbi-value-description{font-size:12px;opacity:.65;margin-top:5px}' +
+	'.pks-form input.cbi-input-text,.pks-form select.cbi-input-select,.pks-form textarea.cbi-input-textarea{border-radius:6px}' +
+	'.pks-form input.cbi-input-text{max-width:440px}' +
+	'.pks-form .cbi-button-add{border-radius:6px}' +
+	'.pks-form .cbi-dynlist .btn{margin-left:8px}' +
+	'.pks-form .cbi-section{margin:0 0 1rem}' +
+	'.pks-form .cbi-section>h3{font-size:12px;font-weight:500;opacity:.55;text-transform:uppercase;letter-spacing:.6px;margin:1rem 0 .3rem}' +
+	'.pks-form .cbi-section:first-of-type>h3{margin-top:.3rem}';
 
 function pksTile(label, val) {
 	return E('div', { 'class': 'pks-tile' }, [
@@ -83,9 +102,9 @@ function pksTile(label, val) {
 
 function renderStatusInner(st) {
 	st = st || {};
-	var ok = (st.status === 'ok'), err = (st.status === 'error');
-	var color = ok ? '#3fb950' : (err ? '#f85149' : '#8b949e');
-	var label = ok ? _('OK') : (err ? _('Ошибка') : _('не запускалось'));
+	var ok = (st.status === 'ok'), err = (st.status === 'error'), warn = (st.status === 'warn');
+	var color = ok ? '#3fb950' : (err ? '#f85149' : (warn ? '#d29922' : '#8b949e'));
+	var label = ok ? _('OK') : (err ? _('Ошибка') : (warn ? _('Внимание') : _('не запускалось')));
 
 	return [
 		E('div', { 'class': 'pks-tiles' }, [
@@ -139,7 +158,7 @@ function renderNodesPanel(nodes) {
 	});
 
 	var body = tbody.children.length
-		? E('div', { 'class': 'pks-wrap' }, E('div', { 'class': 'pks-scroll' },
+		? E('div', { 'class': 'pks-scroll' },
 			E('table', { 'class': 'pks-tbl' }, [
 				E('thead', {}, E('tr', {}, [
 					E('th', {}, _('Название')),
@@ -148,10 +167,10 @@ function renderNodesPanel(nodes) {
 					E('th', { 'class': 'pks-r' }, _('Порт'))
 				])),
 				tbody
-			])))
+			]))
 		: E('em', { 'style': 'opacity:.7' }, _('Нод пока нет — запустите обновление.'));
 
-	return E('div', { 'id': 'podkop-nodes-panel' }, [
+	return E('div', { 'id': 'podkop-nodes-panel', 'class': 'pks-card' }, [
 		E('div', { 'class': 'pks-bar' }, [
 			E('span', { 'class': 't' }, _('Активные ноды')), cntPill, filter
 		]),
@@ -179,18 +198,14 @@ return view.extend({
 		/* ---- форма настроек (нативный LuCI, даёт Save & Apply) ---- */
 		/* без заголовка/описания у самой формы — свой компактный заголовок сверху,
 		   а всю форму прячем в сворачиваемую секцию «Настройки» */
-		var m = new form.Map('podkop_sub');
+		var o, s;
 
-		var s = m.section(form.NamedSection, 'config', 'podkop_sub');
+		/* карта 1 — «Источники нод»: видима, над таблицей (ввёл ссылку → сразу
+		   ниже видишь ноды). Форма из двух карт одного конфига; Save & Apply
+		   сохраняет обе. */
+		var mSrc = new form.Map('podkop_sub');
+		s = mSrc.section(form.NamedSection, 'config', 'podkop_sub', _('Источники нод'));
 		s.anonymous = true;
-
-		var o;
-
-		o = s.option(form.Flag, 'enabled', _('Включить сервис'),
-			_('Когда выключено — автообновление по расписанию отключено ' +
-			  '(ручное «Обновить сейчас» продолжает работать).'));
-		o.default = '1';
-		o.rmempty = false;
 
 		o = s.option(form.DynamicList, 'url', _('Ссылки на подписки'),
 			_('JSON, Base64 и обычные списки vless:// определяются автоматически. ' +
@@ -205,10 +220,20 @@ return view.extend({
 		o.monospace = true;
 		o.placeholder = 'vless://uuid@host:443?type=tcp&security=reality&...#Имя';
 
+		/* карта 2 — прочие настройки (в сворачиваемом блоке ниже таблицы) */
+		var mSet = new form.Map('podkop_sub');
+
+		s = mSet.section(form.NamedSection, 'config', 'podkop_sub', _('Применение'));
+		s.anonymous = true;
+
 		o = s.option(form.ListValue, 'section', _('Целевая секция Podkop'),
-			_('Ноды пишутся в urltest_proxy_links выбранной секции.'));
+			_('Ноды пишутся в urltest_proxy_links выбранной секции. ' +
+			  'Работают только секции в режиме URLTest.'));
 		if (sections.length === 0) o.value('main', 'main');
-		sections.forEach(function(sec) { o.value(sec, sec); });
+		sections.forEach(function(sec) {
+			var t = uci.get('podkop', sec, 'proxy_config_type') || '';
+			o.value(sec, (t && t !== 'urltest') ? (sec + ' — ' + t + ' (не URLTest)') : sec);
+		});
 		o.default = 'main';
 
 		o = s.option(form.Flag, 'deduplicate', _('Удалять дубликаты серверов'));
@@ -220,7 +245,16 @@ return view.extend({
 		o.default = '1';
 		o.rmempty = false;
 
-		o = s.option(form.ListValue, 'cron', _('Расписание автообновления'),
+		s = mSet.section(form.NamedSection, 'config', 'podkop_sub', _('Автообновление'));
+		s.anonymous = true;
+
+		o = s.option(form.Flag, 'enabled', _('Включить сервис'),
+			_('Когда выключено — автообновление по расписанию отключено ' +
+			  '(ручное «Обновить сейчас» продолжает работать).'));
+		o.default = '1';
+		o.rmempty = false;
+
+		o = s.option(form.ListValue, 'cron', _('Расписание'),
 			_('Запускает синхронизацию автоматически через cron.'));
 		o.value('0', _('Выключено'));
 		o.value('6', _('Каждые 6 часов'));
@@ -228,8 +262,15 @@ return view.extend({
 		o.value('24', _('Раз в сутки'));
 		o.default = '24';
 
+		s = mSet.section(form.NamedSection, 'config', 'podkop_sub', _('Сеть'));
+		s.anonymous = true;
+
 		o = s.option(form.Value, 'user_agent', _('User-Agent'),
-			_('Отправляется curl при скачивании подписок.'));
+			_('Отправляется curl при скачивании подписок. Пресеты дают Xray/base64, ' +
+			  'который понимает парсер; можно вписать и свой.'));
+		o.value('v2rayNG/1.9.5', 'v2rayNG/1.9.5');
+		o.value('Happ/1.60.0', 'Happ/1.60.0');
+		o.value('v2rayN/7.0', 'v2rayN/7.0');
 		o.default = 'v2rayNG/1.9.5';
 
 		/* ---- статус + кнопка + таблица (вне формы) ---- */
@@ -278,27 +319,31 @@ return view.extend({
 
 		var extra = E('div', { 'class': 'cbi-section' }, [
 			E('style', {}, PKS_CSS),
-			E('h2', { 'style': 'margin:0 0 2px' }, 'Podkop Sync'),
-			E('p', { 'class': 'pks-cap' },
-				_('Скачивает подписки, разбирает в vless-ссылки и применяет к секции podkop (URLTest).')),
-			E('p', {}, [
+			E('div', { 'class': 'pks-head' }, [
+				E('div', {}, [
+					E('h2', {}, 'Podkop Sync'),
+					E('div', { 'class': 'pks-cap', 'style': 'margin:2px 0 0' },
+						_('Подписки и ручные ноды → секция podkop (URLTest).'))
+				]),
 				E('button', {
 					'class': 'btn cbi-button cbi-button-apply',
+					'style': 'flex:none',
+					'title': _('Сохраняет настройки и сразу обновляет'),
 					'click': ui.createHandlerFn(this, onSyncNow)
-				}, _('Обновить сейчас')),
-				E('span', { 'style': 'margin-left:1em;opacity:.7' },
-					_('Сохраняет настройки и сразу обновляет.'))
+				}, _('Обновить сейчас'))
 			]),
-			statusBox,
-			nodesBox
+			E('div', { 'class': 'pks-card' }, statusBox)
 		]);
 
-		return m.render().then(function(mapEl) {
-			var settings = E('details', { 'class': 'pks-set' }, [
+		return Promise.all([ mSrc.render(), mSet.render() ]).then(function(maps) {
+			var srcCard = E('div', { 'class': 'pks-form', 'style': 'margin-bottom:1rem' },
+				[ maps[0] ]);
+			var settings = E('details', { 'class': 'pks-set pks-form' }, [
 				E('summary', {}, _('Настройки')),
-				mapEl
+				maps[1]
 			]);
-			return E('div', {}, [ extra, settings ]);
+			/* порядок: заголовок+статус → источники+кнопка → таблица нод → настройки */
+			return E('div', {}, [ extra, srcCard, nodesBox, settings ]);
 		});
 	}
 });

@@ -83,11 +83,24 @@ check_deps() {
 cmd_sync() {
 	load_cfg
 
+	# (2) целевая секция должна существовать в podkop
+	if [ -z "$(uci -q get "podkop.$SECTION" 2>/dev/null)" ]; then
+		set_status "error" "Секция '$SECTION' не найдена в podkop" ""
+		log err "target section '$SECTION' does not exist"
+		return 1
+	fi
+	# (1) режим секции: не URLTest — пишем, но предупреждаем (podkop их не читает)
+	local secwarn=""
+	if [ "$(uci -q get "podkop.$SECTION.proxy_config_type" 2>/dev/null)" != "urltest" ]; then
+		secwarn="⚠ Секция '$SECTION' не в режиме URLTest — podkop не использует эти ноды. "
+		log warn "section '$SECTION' is not urltest; nodes written but ignored by podkop"
+	fi
+
 	rm -rf "$TMPDIR"
 	mkdir -p "$TMPDIR" || { log err "cannot create $TMPDIR"; return 1; }
 	local links="$TMPDIR/links.txt"
 	: > "$links"
-	local ok=0 count=0 nosub=0
+	local count=0 nosub=0 persub=""
 
 	if [ -z "$(printf '%s' "$URLS" | tr -d '[:space:]')" ]; then
 		# нет ни одной подписки — это НЕ ошибка: чистим ноды подписки,
@@ -102,9 +115,10 @@ cmd_sync() {
 			return 1
 		fi
 
-		# скачивание всех подписок; при ЛЮБОЙ ошибке — прерываем (fail-safe).
-		# Каждая подписка — отдельный файл и отдельный парс (форматы разные).
-		local parts="" i=0
+		# Скачиваем каждую подписку отдельно, считаем ноды по каждой и НЕ падаем
+		# из-за одной битой — работаем с теми, что дали ноды. В persub — сводка
+		# по каждой (для UI: понятно, какая в ауте).
+		local parts="" ok=0 i=0 c
 		local OLDIFS="$IFS"; IFS='
 '
 		for url in $URLS; do
@@ -112,21 +126,30 @@ cmd_sync() {
 			i=$((i + 1))
 			local part="$TMPDIR/sub_$i.txt"
 			if curl -fsS -A "$USER_AGENT" \
-				--connect-timeout 10 --max-time 30 \
-				-o "$part" "$url"; then
-				parts="$parts $part"
-				ok=$((ok + 1))
+				--connect-timeout 10 --max-time 30 -o "$part" "$url"; then
+				c=$("$PYTHON" "$PARSER" "$part" 2>/dev/null | grep -c . || echo 0)
+				if [ "$c" -gt 0 ]; then
+					parts="$parts $part"; ok=$((ok + 1)); persub="$persub #$i=$c"
+				else
+					persub="$persub #$i=0(пусто)"
+					log warn "subscription #$i returned 0 nodes: $url"
+				fi
 			else
-				IFS="$OLDIFS"
-				set_status "error" "Ошибка скачивания подписки: $url" ""
-				log err "download failed, keeping current config: $url"
-				rm -rf "$TMPDIR"
-				return 1
+				persub="$persub #$i=нет_сети"
+				log err "subscription #$i download failed: $url"
 			fi
 		done
 		IFS="$OLDIFS"
 
-		# парсинг (все источники разом, глобальный дедуп/нумерация)
+		# все подписки в ауте — fail-safe: конфиг НЕ трогаем
+		if [ "$ok" -eq 0 ]; then
+			set_status "error" "Ни одна подписка не дала нод:$persub (конфиг не изменён)" ""
+			log warn "all subscriptions failed/empty, keeping current config"
+			rm -rf "$TMPDIR"
+			return 1
+		fi
+
+		# итоговый разбор рабочих подписок (глобальный дедуп/нумерация)
 		local pflag=""
 		[ "$DEDUP" = "0" ] && pflag="--all"
 		if ! "$PYTHON" "$PARSER" $pflag $parts > "$links" 2>"$TMPDIR/err.log"; then
@@ -135,28 +158,28 @@ cmd_sync() {
 			rm -rf "$TMPDIR"
 			return 1
 		fi
-
 		count=$(grep -c . "$links" 2>/dev/null || echo 0)
-		if [ "$count" -eq 0 ]; then
-			# подписка скачалась, но нод 0 (заглушка/битый ответ) — fail-safe,
-			# конфиг НЕ трогаем (в отличие от осознанного «нет подписок»)
-			set_status "error" "Парсер не вернул ни одной ноды (конфиг не изменён)" "0"
-			log warn "0 nodes parsed, keeping current config"
-			rm -rf "$TMPDIR"
-			return 1
-		fi
 	fi
 
 	# --- «наши» ноды: ручные из поля manual_nodes + ноды подписки ------------
 	local ourlinks="$TMPDIR/our.txt"
 	: > "$ourlinks"
-	local mcount=0
-	# ручные ноды: по одной vless:// в строке, пробелы обрезаем, мусор пропускаем
+	local mcount=0 mskip=0
+	# ручные ноды: по одной vless:// в строке. Обрезаем пробелы по краям; строки
+	# с пробелом ВНУТРИ ссылки пропускаем (незакодированный фрагмент сломал бы
+	# uci-список и разбор статуса — сценарий 3).
 	printf '%s' "$MANUAL" | tr -d '\r' > "$TMPDIR/manual_raw.txt"
 	while IFS= read -r ml || [ -n "$ml" ]; do
 		ml=$(printf '%s' "$ml" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
 		case "$ml" in
-			vless://*) printf '%s\n' "$ml" >> "$ourlinks"; mcount=$((mcount + 1)) ;;
+			vless://*)
+				case "$ml" in
+					*[[:space:]]*)
+						mskip=$((mskip + 1))
+						log warn "manual node with internal space skipped (encode the #name)" ;;
+					*)
+						printf '%s\n' "$ml" >> "$ourlinks"; mcount=$((mcount + 1)) ;;
+				esac ;;
 		esac
 	done < "$TMPDIR/manual_raw.txt"
 	# ноды подписки
@@ -215,10 +238,18 @@ cmd_sync() {
 	# разбивка для плиток в UI (из подписки / вручную = поле + внешние)
 	uci -q set podkop_sub.config.last_sub="$count"
 	uci -q set podkop_sub.config.last_manual="$((mcount + kept))"
+
+	# сводка ручных: сколько пропущено из-за пробелов
+	local mnote=""
+	[ "$mskip" -gt 0 ] && mnote=" (пропущено ручных с пробелом: $mskip)"
+	# статус warn, если секция не в режиме URLTest
+	local slvl="ok"
+	[ -n "$secwarn" ] && slvl="warn"
+
 	if [ "$nosub" = 1 ]; then
-		set_status "ok" "Без подписки. Вручную: $mcount, внешних: $kept, всего: $total" "$total"
+		set_status "$slvl" "${secwarn}Без подписки. Вручную: $mcount, внешних: $kept, всего: $total$mnote" "$total"
 	else
-		set_status "ok" "Из подписки: $count, вручную: $mcount, внешних: $kept, всего: $total" "$total"
+		set_status "$slvl" "${secwarn}Подписки:$persub · вручную: $mcount, внешних: $kept, всего: $total$mnote" "$total"
 	fi
 	log info "sync ok: sub=$count manual=$mcount external=$kept total=$total in '$SECTION'"
 	rm -rf "$TMPDIR"

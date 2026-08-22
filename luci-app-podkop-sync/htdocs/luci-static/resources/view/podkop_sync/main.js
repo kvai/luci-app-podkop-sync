@@ -46,53 +46,112 @@ function fmtTime(epoch) {
 	return new Date(epoch * 1000).toLocaleString();
 }
 
+/* scoped-стили: theme-agnostic (rgba-оверлеи + currentColor), работают в
+   тёмной и светлой теме LuCI без знания её палитры. */
+var PKS_CSS =
+	'.pks-tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin:.4rem 0 .6rem}' +
+	'.pks-tile{background:rgba(128,128,128,.12);border-radius:8px;padding:10px 14px}' +
+	'.pks-tile .l{font-size:12px;opacity:.7}' +
+	'.pks-tile .v{font-size:22px;font-weight:500;line-height:1.3}' +
+	'.pks-cap{font-size:12px;opacity:.7;margin:0 0 1rem}' +
+	'.pks-bar{display:flex;align-items:center;gap:10px;margin:.2rem 0 .5rem;flex-wrap:wrap}' +
+	'.pks-bar .t{font-size:15px;font-weight:500}' +
+	'.pks-pill{font-size:12px;opacity:.85;background:rgba(128,128,128,.15);border-radius:20px;padding:2px 9px}' +
+	'.pks-flt{margin-left:auto}' +
+	'.pks-wrap{border:1px solid rgba(128,128,128,.28);border-radius:8px;overflow:hidden}' +
+	'.pks-scroll{max-height:360px;overflow:auto}' +
+	'.pks-tbl{width:100%;border-collapse:collapse;font-size:13px}' +
+	'.pks-tbl th{text-align:left;font-weight:500;opacity:.7;padding:9px 12px;border-bottom:1px solid rgba(128,128,128,.28)}' +
+	'.pks-tbl td{padding:8px 12px;border-bottom:1px solid rgba(128,128,128,.16)}' +
+	'.pks-tbl tr:nth-child(even) td{background:rgba(128,128,128,.06)}' +
+	'.pks-r{text-align:right}' +
+	'.pks-mono{font-family:monospace;opacity:.85}' +
+	'.pks-chip{font-family:monospace;font-size:11px;opacity:.85;background:rgba(128,128,128,.15);border:1px solid rgba(128,128,128,.28);border-radius:4px;padding:1px 6px;white-space:nowrap}' +
+	'.pks-dot{width:8px;height:8px;border-radius:50%;display:inline-block;vertical-align:middle;margin-right:7px}';
+
+function pksTile(label, val) {
+	return E('div', { 'class': 'pks-tile' }, [
+		E('div', { 'class': 'l' }, label),
+		E('div', { 'class': 'v' }, val)
+	]);
+}
+
 function renderStatusInner(st) {
 	st = st || {};
-	var ok = (st.status === 'ok');
-	var color = ok ? '#4caf50' : (st.status === 'error' ? '#f44336' : '#9e9e9e');
-	var label = ok ? _('OK') : (st.status === 'error' ? _('Ошибка') : _('не запускалось'));
+	var ok = (st.status === 'ok'), err = (st.status === 'error');
+	var color = ok ? '#3fb950' : (err ? '#f85149' : '#8b949e');
+	var label = ok ? _('OK') : (err ? _('Ошибка') : _('не запускалось'));
 
 	return [
-		E('p', {}, [
-			E('strong', {}, _('Статус') + ': '),
-			E('span', { 'style': 'color:' + color + ';font-weight:bold' }, label),
-			st.message ? E('span', { 'style': 'margin-left:1em;color:#888' }, String(st.message)) : ''
+		E('div', { 'class': 'pks-tiles' }, [
+			pksTile(_('Всего нод'), String(st.count || 0)),
+			pksTile(_('Из подписки'), String(st.sub || 0)),
+			pksTile(_('Вручную'), String(st.manual || 0)),
+			E('div', { 'class': 'pks-tile' }, [
+				E('div', { 'class': 'l' }, _('Статус')),
+				E('div', { 'class': 'v', 'style': 'font-size:15px;display:flex;align-items:center;gap:7px' }, [
+					E('span', { 'class': 'pks-dot', 'style': 'background:' + color }), label
+				]),
+				E('div', { 'style': 'font-size:11px;opacity:.7;margin-top:2px' }, fmtTime(st.last_update))
+			])
 		]),
-		E('p', {}, [
-			E('strong', {}, _('Нод') + ': '),
-			E('span', {}, String(st.count || 0)),
-			E('strong', { 'style': 'margin-left:2em' }, _('Обновлено') + ': '),
-			E('span', {}, fmtTime(st.last_update)),
-			E('strong', { 'style': 'margin-left:2em' }, _('Секция') + ': '),
-			E('span', {}, String(st.section || 'main'))
+		E('div', { 'class': 'pks-cap' }, [
+			st.message ? String(st.message) + ' · ' : '',
+			_('секция') + ' ' + String(st.section || 'main')
 		])
 	];
 }
 
-function renderNodesTable(nodes) {
+function renderNodesPanel(nodes) {
 	nodes = Array.isArray(nodes) ? nodes : [];
-	var rows = [];
+	var tbody = E('tbody', {});
 	nodes.forEach(function(link) {
 		var n = parseVless(link);
 		if (!n) return;
-		rows.push([
-			n.name,
-			E('span', { 'class': 'ifacebadge' }, n.proto + ' / ' + n.net),
-			n.host,
-			n.port
-		]);
+		var proto = n.proto.replace('VLESS · ', '');
+		tbody.appendChild(E('tr', {}, [
+			E('td', {}, [ E('span', { 'class': 'pks-dot', 'style': 'background:#3fb950' }), n.name ]),
+			E('td', {}, E('span', { 'class': 'pks-chip' }, proto + ' · ' + n.net.toUpperCase())),
+			E('td', { 'class': 'pks-mono' }, n.host),
+			E('td', { 'class': 'pks-mono pks-r' }, n.port)
+		]));
 	});
 
-	var tbl = E('table', { 'class': 'table', 'id': 'podkop-nodes' }, [
-		E('tr', { 'class': 'tr table-titles' }, [
-			E('th', { 'class': 'th' }, _('Название')),
-			E('th', { 'class': 'th' }, _('Протокол')),
-			E('th', { 'class': 'th' }, _('Хост / IP')),
-			E('th', { 'class': 'th' }, _('Порт'))
-		])
+	var cntPill = E('span', { 'class': 'pks-pill' }, String(tbody.children.length));
+	var filter = E('input', {
+		'type': 'text', 'class': 'cbi-input-text pks-flt',
+		'placeholder': _('Фильтр по имени или хосту'),
+		'style': 'width:230px;max-width:55%'
+	});
+	filter.addEventListener('input', function() {
+		var q = this.value.trim().toLowerCase(), shown = 0;
+		Array.prototype.forEach.call(tbody.children, function(tr) {
+			var ok = tr.textContent.toLowerCase().indexOf(q) > -1;
+			tr.style.display = ok ? '' : 'none';
+			if (ok) shown++;
+		});
+		cntPill.textContent = String(shown);
+	});
+
+	var body = tbody.children.length
+		? E('div', { 'class': 'pks-wrap' }, E('div', { 'class': 'pks-scroll' },
+			E('table', { 'class': 'pks-tbl' }, [
+				E('thead', {}, E('tr', {}, [
+					E('th', {}, _('Название')),
+					E('th', {}, _('Протокол')),
+					E('th', {}, _('Хост / IP')),
+					E('th', { 'class': 'pks-r' }, _('Порт'))
+				])),
+				tbody
+			])))
+		: E('em', { 'style': 'opacity:.7' }, _('Нод пока нет — запустите обновление.'));
+
+	return E('div', { 'id': 'podkop-nodes-panel' }, [
+		E('div', { 'class': 'pks-bar' }, [
+			E('span', { 'class': 't' }, _('Активные ноды')), cntPill, filter
+		]),
+		body
 	]);
-	cbi_update_table(tbl, rows, E('em', _('Нод пока нет — запустите обновление.')));
-	return tbl;
 }
 
 return view.extend({
@@ -170,7 +229,7 @@ return view.extend({
 
 		/* ---- статус + кнопка + таблица (вне формы) ---- */
 		var statusBox = E('div', { 'id': 'podkop-status' }, renderStatusInner(status));
-		var nodesBox = renderNodesTable(status.nodes);
+		var nodesBox = renderNodesPanel(status.nodes);
 
 		function onSyncNow() {
 			var self = this;
@@ -198,8 +257,8 @@ return view.extend({
 				res = res || {};
 
 				dom.content(statusBox, renderStatusInner(res));
-				var newNodes = renderNodesTable(res.nodes);
-				var old = document.getElementById('podkop-nodes');
+				var newNodes = renderNodesPanel(res.nodes);
+				var old = document.getElementById('podkop-nodes-panel');
 				if (old && old.parentNode) old.parentNode.replaceChild(newNodes, old);
 
 				if (res.status === 'ok')
@@ -212,23 +271,18 @@ return view.extend({
 			});
 		}
 
-		var extra = E('div', {}, [
-			E('div', { 'class': 'cbi-section' }, [
-				E('h3', {}, _('Последнее обновление')),
-				E('p', {}, [
-					E('button', {
-						'class': 'btn cbi-button cbi-button-apply',
-						'click': ui.createHandlerFn(this, onSyncNow)
-					}, _('Обновить сейчас')),
-					E('span', { 'style': 'margin-left:1em;color:#888' },
-						_('Сохраняет настройки выше и сразу обновляет.'))
-				]),
-				statusBox
+		var extra = E('div', { 'class': 'cbi-section' }, [
+			E('style', {}, PKS_CSS),
+			E('p', {}, [
+				E('button', {
+					'class': 'btn cbi-button cbi-button-apply',
+					'click': ui.createHandlerFn(this, onSyncNow)
+				}, _('Обновить сейчас')),
+				E('span', { 'style': 'margin-left:1em;opacity:.7' },
+					_('Сохраняет настройки выше и сразу обновляет.'))
 			]),
-			E('div', { 'class': 'cbi-section' }, [
-				E('h3', {}, _('Активные ноды')),
-				nodesBox
-			])
+			statusBox,
+			nodesBox
 		]);
 
 		return m.render().then(function(mapEl) {

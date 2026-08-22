@@ -212,6 +212,9 @@ cmd_sync() {
 	podkop reload >/dev/null 2>&1 || podkop restart >/dev/null 2>&1
 
 	local total=$((count + mcount + kept))
+	# разбивка для плиток в UI (из подписки / вручную = поле + внешние)
+	uci -q set podkop_sub.config.last_sub="$count"
+	uci -q set podkop_sub.config.last_manual="$((mcount + kept))"
 	if [ "$nosub" = 1 ]; then
 		set_status "ok" "Без подписки. Вручную: $mcount, внешних: $kept, всего: $total" "$total"
 	else
@@ -265,10 +268,12 @@ cmd_update_cron() {
 cmd_status() {
 	config_load podkop_sub
 	config_get SECTION config section "main"
-	local st ms up
+	local st ms up sub man
 	config_get st  config last_status  ""
 	config_get ms  config last_message ""
 	config_get up  config last_update  "0"
+	config_get sub config last_sub     "0"
+	config_get man config last_manual  "0"
 
 	# Собираем ноды секции и считаем РЕАЛЬНОЕ количество (а не сохранённое
 	# last_count) — так счётчик всегда совпадает с таблицей.
@@ -286,10 +291,10 @@ cmd_status() {
 		cnt=$((cnt + 1))
 	done
 
-	printf '{"status":"%s","message":"%s","last_update":%s,"count":%s,"section":"%s","nodes":[%s]}\n' \
+	printf '{"status":"%s","message":"%s","last_update":%s,"count":%s,"sub":%s,"manual":%s,"section":"%s","nodes":[%s]}\n' \
 		"$(printf '%s' "$st" | json_escape)" \
 		"$(printf '%s' "$ms" | json_escape)" \
-		"${up:-0}" "$cnt" "$(printf '%s' "$SECTION" | json_escape)" \
+		"${up:-0}" "$cnt" "${sub:-0}" "${man:-0}" "$(printf '%s' "$SECTION" | json_escape)" \
 		"$nodes_json"
 }
 

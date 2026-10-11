@@ -320,6 +320,21 @@ for label, data in (("group first", [group, solo]), ("solo first", [solo, group]
     check("dedup: single-server profile name wins (%s)" % label, names == ["Турция (БС-4)", "Швеция"]
           and any("h1.example" in l and l.endswith(ps.encode_fragment("Швеция")) for l in ps.render_links(ps.nodes_from_json(data))), str(names))
 
+# 26) имя, которое подписка выдаёт неизменно, применяется даже к работающей ноде
+def smp(sni): return ps.parse_input("vless://u-1@h1.example:443?pbk=K1&security=reality&sid=zz&sni=%s&type=tcp#A" % sni)
+cons = ps.sni_consensus([smp("api.example"), smp("api.example"), smp("api.example"), smp("api.example")])
+check("consensus: same sni in all samples", list(cons.values()) == ["api.example"], str(cons))
+check("consensus: differing samples give nothing", ps.sni_consensus([smp("a.example"), smp("b.example"), smp("a.example")]) == {})
+check("consensus: too few samples give nothing", ps.sni_consensus([smp("a.example"), smp("a.example")]) == {})
+cur26 = ["vless://u-1@h1.example:443?pbk=K1&security=reality&sid=s0&sni=old.example&type=tcp#A"]
+f26 = smp("api.example"); sw = []
+k26 = ps.apply_sticky(f26, cur26, {"main-1-out": True}, "main", consensus=cons, switched=sw)
+check("consensus: working node takes the chosen sni", "sni=api.example" in ps.render_links(f26)[0] and k26 == 0 and len(sw) == 1)
+f27 = smp("api.example")
+k27 = ps.apply_sticky(f27, ["vless://u-1@h1.example:443?pbk=K1&security=reality&sid=s0&sni=api.example&type=tcp#A"],
+                      {"main-1-out": True}, "main", consensus=cons, switched=[])
+check("consensus: already on the chosen sni -> stays sticky (short id kept)", k27 == 1 and "sid=s0" in ps.render_links(f27)[0])
+
 print()
 print("FAILURES:", failures)
 sys.exit(1 if failures else 0)

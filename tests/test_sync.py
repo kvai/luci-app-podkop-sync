@@ -104,6 +104,11 @@ while [ $# -gt 0 ]; do
 done
 f="$STUB/subs/$(basename "$url")"
 [ -f "$f" ] || exit 22
+# повторные скачивания первой подписки (sample_2..4): свой вариант ответа, если он задан —
+# так тесты изображают панель, которая каждый раз выдаёт другие SNI
+case "$(basename "$out")" in
+	sample_*) k="${out##*sample_}"; k="${k%.txt}"; [ -f "$f.s$k" ] && { cp "$f.s$k" "$out"; exit 0; } ;;
+esac
 cp "$f" "$out"
 '''
 
@@ -218,9 +223,22 @@ class SyncEnv(unittest.TestCase):
         d[pkg][sec][opt] = val
         self.write_db(d)
 
-    def sub(self, name, text):
-        with open(os.path.join(self.stub, "subs", name), "w", encoding="utf-8") as f:
+    auto_noise = False
+
+    def sub(self, name, text, noisy=None):
+        """Задать ответ подписки. noisy=True: при повторных скачиваниях панель выдаёт другие SNI
+        (как 3x-ui со списком из нескольких имён); False: всегда один и тот же ответ."""
+        import re
+        base = os.path.join(self.stub, "subs", name)
+        with open(base, "w", encoding="utf-8") as f:
             f.write(text)
+        noisy = self.auto_noise if noisy is None else noisy
+        for k in (2, 3, 4):
+            if noisy:
+                with open("%s.s%d" % (base, k), "w", encoding="utf-8") as f:
+                    f.write(re.sub(r"sni=([^&#\n]+)", lambda m: "sni=r%d.%s" % (k, m.group(1)), text))
+            elif os.path.exists("%s.s%d" % (base, k)):
+                os.remove("%s.s%d" % (base, k))
 
     def flag(self, name, on=True):
         p = os.path.join(self.stub, name)
@@ -562,6 +580,7 @@ class StickyTests(SyncEnv):
     """Подписка (3x-ui) каждый раз выдаёт случайные SNI и short id из списков ноды."""
     N1_ROLLED = N1.replace("sni=www.example.com", "sni=other.example.com").replace("sid=aa11", "sid=ff99")
     N2_ROLLED = N2.replace("sid=bb22", "sid=ee88")
+    auto_noise = True       # в этих тестах панель при каждом скачивании выдаёт другой SNI
 
     def test_working_nodes_keep_sni_and_short_id(self):
         self.sync()
@@ -725,6 +744,60 @@ class StickyTests(SyncEnv):
     def test_health_is_requested_from_clash_api(self):
         self.sync()
         self.assertTrue(any("http://127.0.0.1:9090/proxies" in l for l in self.log("curl.log")))
+
+
+class ChosenSniTests(SyncEnv):
+    """Владелец оставил на сервере одно имя SNI: оно должно примениться, даже если прежнее ещё работает."""
+    NEW = N1.replace("sni=www.example.com", "sni=api.example.ru")
+
+    def test_consistent_new_sni_is_applied_to_a_working_node(self):
+        self.sync()
+        self.health(**{"main-1-out": 120, "main-2-out": 95})
+        self.sub("one", self.NEW + "\n" + N2 + "\n")            # все скачивания дают одно и то же имя
+        self.assertEqual(self.sync(), 0)
+        self.assertIn("sni=api.example.ru", self.links()[0])
+        self.assertEqual(self.links()[1], N2, "вторая нода не менялась — её не трогаем")
+        self.assertEqual(self.reloads(), 2)
+        self.assertIn("приняты новые SNI с сервера: 1", self.status()[1])
+        self.assertEqual(self.sync(), 0)                           # дальше тихо
+        self.assertEqual(self.reloads(), 2)
+        self.assertIn("Без изменений", self.status()[1])
+        self.assertEqual(len([l for l in self.log("curl.log") if "sample_" in l]) % 3, 0, "по три доп. скачивания на синк")
+
+    def test_random_sni_is_still_ignored(self):
+        self.sync()
+        self.health(**{"main-1-out": 120, "main-2-out": 95})
+        self.sub("one", self.NEW + "\n" + N2 + "\n", noisy=True)  # панель выдаёт случайные имена
+        self.assertEqual(self.sync(), 0)
+        self.assertEqual(self.links(), [N1, N2])
+        self.assertEqual(self.reloads(), 1)
+
+    def test_consistent_sni_revives_a_frozen_dead_node(self):
+        self.sync()
+        self.health(**{"main-1-out": None, "main-2-out": 95})
+        rolled = N1.replace("sni=www.example.com", "sni=bad.example.com")
+        self.sub("one", rolled + "\n" + N2 + "\n", noisy=True)
+        self.sync()                                                # нода не отвечает: свежие значения, один раз
+        dead_link = self.links()[0]
+        self.sub("one", rolled.replace("bad.example.com", "bad2.example.com") + "\n" + N2 + "\n", noisy=True)
+        self.sync()
+        self.assertEqual(self.links()[0], dead_link, "лежащую ноду со случайными именами больше не трогаем")
+        self.sub("one", self.NEW + "\n" + N2 + "\n")            # владелец оставил одно имя
+        n = self.reloads()
+        self.assertEqual(self.sync(), 0)
+        self.assertIn("sni=api.example.ru", self.links()[0])
+        self.assertEqual(self.reloads(), n + 1)
+
+    def test_only_first_subscription_is_sampled(self):
+        self.set_opt("podkop_sub", "config", "url", ["https://sub.test/one", "https://sub.test/two"])
+        foreign = N2.replace("n2.example.net", "x7.example.net").replace("PBK_TWO", "PBK_X7").split("#")[0] + "#Foreign"
+        self.sub("two", foreign + "\n")
+        self.sync()
+        self.health(**{"main-1-out": 120, "main-2-out": 95, "main-3-out": 80})
+        self.sub("two", foreign.replace("sni=www.example.org", "sni=other.example.org") + "\n")
+        self.assertEqual(self.sync(), 0)
+        self.assertEqual(self.links()[2], foreign, "чужая подписка: одно скачивание, имя остаётся закреплённым")
+        self.assertFalse(any("sample_" in l and "two" in l for l in self.log("curl.log")))
 
 
 class VersionTests(SyncEnv):
@@ -977,7 +1050,7 @@ class OriginsTests(SyncEnv):
     def test_origins_use_sticky_links(self):
         self.sync()
         self.health(**{"main-1-out": 120, "main-2-out": 95})
-        self.sub("one", StickyTests.N1_ROLLED + "\n" + N2 + "\n")
+        self.sub("one", StickyTests.N1_ROLLED + "\n" + N2 + "\n", noisy=True)
         self.sync()
         self.assertEqual(self.origins(), [("1", N1), ("1", N2)], "в файле те же ссылки, что записаны в podkop")
 

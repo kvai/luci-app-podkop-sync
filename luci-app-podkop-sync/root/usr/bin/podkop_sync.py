@@ -462,8 +462,35 @@ def key_of_link(link):
     return repr(sticky_key(node)) if node else None
 
 
+def sni_consensus(samples):
+    """По нескольким скачиваниям одной подписки: {ключ ноды: SNI}, если во ВСЕХ
+    скачиваниях нода пришла с одним и тем же SNI.
+
+    Панель выдаёт SNI случайно из списка ноды. Если несколько скачиваний подряд
+    дали одно имя — в списке (почти наверняка) только оно, то есть владелец
+    сервера выбрал именно его. Такое имя нужно применять, даже если прежнее
+    ещё работает.
+    """
+    if len(samples) < 3:
+        return {}
+    seen = defaultdict(list)
+    for sample in samples:
+        got = {}
+        for node in sample:
+            got.setdefault(repr(sticky_key(node)), set()).add(node["params"].get("sni", ""))
+        for key, snis in got.items():
+            seen[key].append(snis)
+    out = {}
+    for key, per_sample in seen.items():
+        if len(per_sample) == len(samples) and all(len(x) == 1 for x in per_sample):
+            names = set().union(*per_sample)
+            if len(names) == 1:
+                out[key] = next(iter(names))
+    return out
+
+
 def apply_sticky(nodes, current_links, health, section, assume_working=False,
-                 frozen=None, dead_out=None, retry_own=False):
+                 frozen=None, dead_out=None, retry_own=False, consensus=None, switched=None):
     """Вернуть число нод, которым оставлены прежние SNI/short id (nodes правится на месте).
 
     assume_working: данных о здоровье ещё нет (sing-box только что запущен) —
@@ -473,6 +500,9 @@ def apply_sticky(nodes, current_links, health, section, assume_working=False,
     получала бы новый случайный SNI при каждой синхронизации, и список менялся
     бы вечно. Новая попытка — по кнопке в интерфейсе.
     dead_out: сюда (если передан список) кладутся ключи неработающих сейчас нод.
+    consensus: {ключ: SNI}, которые подписка выдаёт неизменно (см. sni_consensus).
+    Если у текущей ноды SNI другой — берём новый, даже если нода работает или
+    «заморожена». switched (список) получает ключи таких нод.
     retry_own: человек нажал «обновить»: «своим» неработающим нодам (первая
     подписка) даём свежие значения ещё раз. Ноды дополнительных подписок по
     кнопке не трогаем — иначе чужие лежащие серверы вызывали бы перезапуск при
@@ -482,12 +512,19 @@ def apply_sticky(nodes, current_links, health, section, assume_working=False,
         return 0
     health = health or {}
     frozen = frozen or set()
+    consensus = consensus or {}
     own = set(repr(sticky_key(n)) for n in nodes if n.get("source", 1) <= 1)
     working = defaultdict(list)     # ключ ноды -> работающие текущие ноды с таким ключом
     for i, link in enumerate(current_links, 1):
         # podkop называет выходы <секция>-<номер ссылки>-out
         cur = node_from_uri(link)
         if not cur:
+            continue
+        wanted = consensus.get(repr(sticky_key(cur)))
+        if wanted is not None and wanted != cur["params"].get("sni", ""):
+            # подписка неизменно выдаёт другое имя — закреплять старое нельзя
+            if switched is not None:
+                switched.append(repr(sticky_key(cur)))
             continue
         if not assume_working and not health.get("%s-%d-out" % (section, i)):
             key_text = repr(sticky_key(cur))
@@ -602,6 +639,9 @@ def main():
                          "их значения повторно не обновляются")
     ap.add_argument("--dead-out", metavar="FILE",
                     help="Записать сюда ключи нод, которые сейчас не работают")
+    ap.add_argument("--sample", metavar="FILE", action="append", default=[],
+                    help="Ещё одно скачивание ПЕРВОЙ подписки (можно несколько раз): если все "
+                         "скачивания дают ноде один и тот же SNI, он применяется сразу")
     ap.add_argument("--retry-own", action="store_true",
                     help="Неработающим нодам первой подписки выдать свежие значения ещё раз")
     ap.add_argument("--assume-working", action="store_true",
@@ -659,9 +699,20 @@ def main():
             except OSError:
                 pass
         dead = [] if args.dead_out else None
+        samples = [[n for n in nodes if n.get("source") == 1]]
+        for path in args.sample:
+            try:
+                with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
+                    samples.append(parse_input(f.read()))
+            except OSError:
+                pass
+        switched = []
         kept = apply_sticky(nodes, current, load_health(args.health or ""), args.section,
                             assume_working=args.assume_working, frozen=frozen, dead_out=dead,
-                            retry_own=args.retry_own)
+                            retry_own=args.retry_own, consensus=sni_consensus(samples),
+                            switched=switched)
+        if switched:
+            print("Принято новых SNI: %d" % len(set(switched)), file=sys.stderr)
         if args.dead_out:
             try:
                 with open(args.dead_out, "w", encoding="utf-8") as f:

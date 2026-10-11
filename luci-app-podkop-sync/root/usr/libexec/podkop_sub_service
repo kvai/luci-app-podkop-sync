@@ -244,7 +244,7 @@ do_sync() {
 	mkdir -p "$WORK" || { log err "cannot create $WORK"; return 1; }
 	local links="$WORK/links.txt"
 	: > "$links"
-	local count=0 nosub=0 persub="" stuck=0 trnote="" mtr=0 deadn=0
+	local count=0 nosub=0 persub="" stuck=0 trnote="" mtr=0 deadn=0 newsni=0
 	local transports="$(supported_transports)"
 	# что сейчас записано в секции podkop (нужно и для закрепления, и для сравнения)
 	local cur="$WORK/cur.txt"
@@ -328,6 +328,21 @@ do_sync() {
 			# sing-box запущен совсем недавно и ещё не успел проверить ноды: пустая
 			# история сейчас значит «нет данных», а не «нода не работает»
 			singbox_is_fresh && sflag="$sflag --assume-working"
+			# Первую подписку скачиваем ещё три раза: если все скачивания дают ноде одно
+			# и то же имя SNI, значит в списке на сервере только оно — применяем его,
+			# даже если прежнее ещё работает (иначе выбранное владельцем имя не
+			# применилось бы, пока старое не сломается).
+			local k first="" su
+			for su in $URLS; do [ -n "$su" ] && { first="$su"; break; }; done
+			case "$first" in
+				http://*|https://*)
+					for k in 2 3 4; do
+						curl -fsSL --max-redirs 3 --proto '=http,https' --proto-redir '=http,https' \
+							--max-filesize 2097152 -A "$USER_AGENT" --connect-timeout 10 --max-time 20 \
+							-o "$WORK/sample_$k.txt" -- "$first" 2>/dev/null \
+							&& sflag="$sflag --sample $WORK/sample_$k.txt"
+					done ;;
+			esac
 		fi
 		if ! "$PYTHON" "$PARSER" --transports "$transports" --origins "$WORK/origins.sub" $pflag $sflag $parts > "$links" 2>"$WORK/err.log"; then
 			set_status "error" "Ошибка парсера: $(tail -n 1 "$WORK/err.log")" ""
@@ -338,6 +353,8 @@ do_sync() {
 		stuck=$(sed -n 's/^Закреплено нод: //p' "$WORK/err.log")
 		case "$stuck" in ''|*[!0-9]*) stuck=0 ;; esac
 		trnote=$(sed -n 's/^Пропущено из-за транспорта: //p' "$WORK/err.log" | head -n 1)
+		newsni=$(sed -n 's/^Принято новых SNI: //p' "$WORK/err.log" | head -n 1)
+		case "$newsni" in ''|*[!0-9]*) newsni=0 ;; esac
 		# запоминаем, какие ноды сейчас не работают (на flash пишем, только если изменилось)
 		if [ -f "$WORK/dead.txt" ]; then
 			cmp -s "$WORK/dead.txt" "$MANAGED_DIR/$SECTION.dead" 2>/dev/null \
@@ -436,6 +453,7 @@ do_sync() {
 		[ "$stuck" -gt 0 ] && summary="$summary · SNI/short id сохранены у работающих: $stuck"
 		[ -n "$trnote" ] && summary="$summary · не поддерживаются podkop и пропущены: $trnote"
 		[ "$deadn" -gt 0 ] && summary="$summary · не отвечают: $deadn"
+		[ "$newsni" -gt 0 ] && summary="$summary · приняты новые SNI с сервера: $newsni"
 	fi
 	# статус warn, если секция не в режиме URLTest
 	local slvl="ok"

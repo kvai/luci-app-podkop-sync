@@ -12,7 +12,7 @@ podkop_sync.py — универсальный парсер прокси-подп
 Диагностика идёт в stderr, чтобы не мешать пайпу.
 
 Зависимости: только стандартная библиотека, доступная в python3-light
-(json, base64, sys, os, argparse, re, collections). urllib НЕ используется —
+(json, base64, sys, argparse, re, collections). urllib НЕ используется —
 percent-encoding/decoding реализованы вручную.
 """
 
@@ -123,6 +123,46 @@ def _node_signature(node):
 
 
 # --------------------------------------------------------------------------
+# Проверка полей ноды
+# --------------------------------------------------------------------------
+# Содержимое подписки — чужие данные: оно попадает в UCI, в конфиг podkop и в
+# таблицу LuCI. Поэтому всё, что не похоже на нормальную ноду, отбрасываем.
+
+_HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$")
+_UUID_RE = re.compile(r"^[A-Za-z0-9._~%-]+$")
+_KEY_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_BAD_CHARS_RE = re.compile(r"[\s\x00-\x1f\x7f]")
+
+
+def skip(reason, what=""):
+    print("Пропущена нода (%s)%s" % (reason, (": " + str(what)[:60]) if what else ""),
+          file=sys.stderr)
+    return None
+
+
+def check_endpoint(uuid, address, port):
+    """Вернуть (uuid, address, port:int) или None, если нода непригодна."""
+    uuid, address = str(uuid or ""), str(address or "")
+    if not _UUID_RE.match(uuid):
+        return skip("некорректный идентификатор")
+    if ":" in address or address.startswith("["):
+        # podkop разбирает адрес по первому «:» и на IPv6 не стартует вовсе
+        return skip("IPv6-адрес не поддерживается podkop", address)
+    if not _HOST_RE.match(address):
+        return skip("некорректный адрес", address)
+    try:
+        port = int(str(port))
+    except ValueError:
+        return skip("некорректный порт", port)
+    if not 1 <= port <= 65535:
+        return skip("некорректный порт", port)
+    # панели отдают заглушку вида 0.0.0.0:1 «приложение не поддерживается»
+    if address == "0.0.0.0" or address.startswith("127.") or port < 2:
+        return skip("заглушка, а не нода", "%s:%s" % (address, port))
+    return uuid, address, port
+
+
+# --------------------------------------------------------------------------
 # Разбор Xray/v2ray JSON outbound -> node
 # --------------------------------------------------------------------------
 
@@ -143,6 +183,10 @@ def node_from_outbound(outbound, raw_remark):
     uuid = user.get("id")
     if not uuid:
         return None
+    checked = check_endpoint(uuid, address, port)
+    if not checked:
+        return None
+    uuid, address, port = checked
 
     stream = outbound.get("streamSettings", {})
     network = stream.get("network", "tcp")
@@ -173,7 +217,8 @@ def node_from_outbound(outbound, raw_remark):
             params["sni"] = t["serverName"]
         params["fp"] = t.get("fingerprint") or "chrome"
         if t.get("alpn"):
-            params["alpn"] = ",".join(t["alpn"])
+            alpn = t["alpn"]
+            params["alpn"] = alpn if isinstance(alpn, str) else ",".join(alpn)
 
     if network == "ws":
         ws = stream.get("wsSettings", {})
@@ -230,23 +275,26 @@ def nodes_from_json(data):
 # Разбор готовой vless:// ссылки -> node
 # --------------------------------------------------------------------------
 
-_VLESS_RE = re.compile(
-    r"^vless://"
-    r"(?P<uuid>[^@]+)@"
-    r"(?P<host>.+):(?P<port>\d+)"
-    r"(?:\?(?P<query>[^#]*))?"
-    r"(?:#(?P<frag>.*))?$",
-    re.IGNORECASE,
-)
-
-
 def node_from_uri(uri):
-    m = _VLESS_RE.match(uri.strip())
-    if not m:
+    uri = uri.strip()
+    if not uri.lower().startswith("vless://"):
         return None
+    # Сначала отрезаем #имя и ?параметры, и только потом делим host:port —
+    # иначе «:цифры» в имени (node-1.2.3.4:8443) принимались за порт.
+    body, _, frag = uri[len("vless://"):].partition("#")
+    body, _, query = body.partition("?")
+    uuid, at, hostport = body.rpartition("@")
+    if not at:
+        return None
+    host, colon, port = hostport.rstrip("/").rpartition(":")
+    if not colon:
+        return None
+    checked = check_endpoint(uuid, host, port)
+    if not checked:
+        return None
+    uuid, host, port = checked
 
     params = {}
-    query = m.group("query") or ""
     for pair in query.split("&"):
         if not pair:
             continue
@@ -254,6 +302,8 @@ def node_from_uri(uri):
             k, v = pair.split("=", 1)
         else:
             k, v = pair, ""
+        if not _KEY_RE.match(k):
+            continue
         params[k] = unq(v)
 
     params.setdefault("type", "tcp")
@@ -262,11 +312,11 @@ def node_from_uri(uri):
     if params["security"] in ("reality", "tls") and not params.get("fp"):
         params["fp"] = "chrome"
 
-    frag = unq(m.group("frag") or "", plus=False).strip()
+    frag = unq(frag, plus=False).strip()
     return {
-        "uuid": m.group("uuid"),
-        "address": m.group("host"),
-        "port": m.group("port"),
+        "uuid": uuid,
+        "address": host,
+        "port": port,
         "params": params,
         "raw_remark": frag or "Server",
     }
@@ -333,6 +383,73 @@ def parse_input(text):
 
 
 # --------------------------------------------------------------------------
+# Закрепление SNI и short id у работающих нод
+# --------------------------------------------------------------------------
+# Панели (3x-ui) при каждом скачивании подписки выдают случайные SNI и short id
+# из списков, заданных на ноде. Без закрепления ссылки «меняются» при каждой
+# синхронизации, а очередное случайное имя может оказаться заблокированным.
+# Правило: если такая же нода уже стоит в podkop И сейчас работает — оставляем
+# её SNI и short id. Не работает или данных о здоровье нет — берём свежие из
+# подписки (так лечится и случай «на сервере убрали имя, нода встала»).
+
+STICKY_FIELDS = ("sni", "sid")
+
+
+def sticky_key(node):
+    """Всё, что определяет ноду, кроме закрепляемых полей и имени."""
+    p = node["params"]
+    return (node["uuid"], node["address"], str(node["port"]),
+            tuple(sorted((k, v) for k, v in p.items() if k not in STICKY_FIELDS)))
+
+
+def load_health(path):
+    """Ответ Clash API sing-box (/proxies) -> {тег: работает ли}. None, если данных нет.
+
+    sing-box хранит историю проверок urltest; после неудачной проверки запись
+    удаляется, поэтому «работает» = есть запись с задержкой больше нуля.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            proxies = json.load(f)["proxies"]
+        health = {}
+        for tag, info in proxies.items():
+            hist = info.get("history") or []
+            health[tag] = bool(hist) and (hist[-1].get("delay") or 0) > 0
+        return health
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def apply_sticky(nodes, current_links, health, section):
+    """Вернуть число нод, которым оставлены прежние SNI/short id (nodes правится на месте)."""
+    if not health:
+        return 0
+    working = []
+    for i, link in enumerate(current_links, 1):
+        # podkop называет выходы <секция>-<номер ссылки>-out
+        if not health.get("%s-%d-out" % (section, i)):
+            continue
+        cur = node_from_uri(link)
+        if cur:
+            working.append(cur)
+    used, kept = set(), 0
+    for node in nodes:
+        key = sticky_key(node)
+        for j, cur in enumerate(working):
+            if j in used or sticky_key(cur) != key:
+                continue
+            used.add(j)
+            for field in STICKY_FIELDS:
+                if field in cur["params"]:
+                    node["params"][field] = cur["params"][field]
+                else:
+                    node["params"].pop(field, None)
+            kept += 1
+            break
+    return kept
+
+
+# --------------------------------------------------------------------------
 # Дедуп, нумерация, генерация ссылок
 # --------------------------------------------------------------------------
 
@@ -361,10 +478,13 @@ def render_links(nodes, deduplicate=True):
             name = "%s #%d" % (name, idx[name])
         query = build_query(node["params"])
         frag = encode_fragment(name)
-        links.append(
-            "vless://%s@%s:%s?%s#%s"
-            % (node["uuid"], node["address"], node["port"], query, frag)
-        )
+        link = "vless://%s@%s:%s?%s#%s" % (
+            node["uuid"], node["address"], node["port"], query, frag)
+        # последний рубеж: в ссылке не должно быть пробелов и управляющих символов
+        if _BAD_CHARS_RE.search(link):
+            skip("недопустимые символы в ссылке")
+            continue
+        links.append(link)
     return links
 
 
@@ -379,6 +499,13 @@ def main():
                          "источник со своим форматом; без аргументов — stdin)")
     ap.add_argument("--all", action="store_true",
                     help="Не удалять дубликаты (сохранить все ноды)")
+    ap.add_argument("--stick", metavar="FILE",
+                    help="Файл с текущими ссылками секции podkop: у работающих "
+                         "нод сохранить прежние SNI и short id")
+    ap.add_argument("--health", metavar="FILE",
+                    help="Сохранённый ответ Clash API sing-box (/proxies)")
+    ap.add_argument("--section", default="main",
+                    help="Имя секции podkop (для тегов выходов sing-box)")
     args = ap.parse_args()
 
     # Каждый источник (файл) детектится и парсится отдельно — форматы могут
@@ -387,13 +514,23 @@ def main():
     try:
         if args.files:
             for path in args.files:
-                with open(path, "r", encoding="utf-8") as f:
+                # utf-8-sig: BOM в начале файла не должен «съедать» первую ноду
+                with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
                     nodes.extend(parse_input(f.read()))
         else:
             nodes.extend(parse_input(sys.stdin.read()))
     except OSError as e:
         print("Ошибка чтения входных данных: %s" % e, file=sys.stderr)
         return 1
+
+    if args.stick:
+        try:
+            with open(args.stick, "r", encoding="utf-8") as f:
+                current = [l.strip() for l in f if l.strip()]
+        except OSError:
+            current = []
+        kept = apply_sticky(nodes, current, load_health(args.health or ""), args.section)
+        print("Закреплено нод: %d" % kept, file=sys.stderr)
 
     links = render_links(nodes, deduplicate=not args.all)
 

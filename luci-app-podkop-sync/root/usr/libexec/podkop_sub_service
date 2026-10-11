@@ -10,15 +10,23 @@
 # Безопасность: все временные файлы — только в /tmp (tmpfs). Рабочий
 # /etc/config/podkop НЕ трогается, если скачивание упало или парсер вернул 0 нод.
 
-. /lib/functions.sh
+# PODKOP_SUB_ROOT / PODKOP_SUB_PATH задаются только в тестах (tests/test_sync.py):
+# на роутере они пусты и все пути абсолютные.
+ROOT="${PODKOP_SUB_ROOT:-}"
+# Версия плагина (показывается в LuCI). Должна совпадать с PKG_VERSION в
+# Makefile — за этим следит tests/test_sync.py.
+VERSION="1.1.0"
+. "$ROOT/lib/functions.sh"
 
 # rpcd/cron запускают нас с урезанным PATH — задаём явно и резолвим python.
-export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH="${PODKOP_SUB_PATH:-/usr/sbin:/usr/bin:/sbin:/bin}"
 PYTHON="$(command -v python3 2>/dev/null || echo /usr/bin/python3)"
 
-PARSER="/usr/bin/podkop_sync.py"
-TMPDIR="/tmp/podkop_sub"
-CRON_FILE="/etc/crontabs/root"
+PARSER="$ROOT/usr/bin/podkop_sync.py"
+# не TMPDIR: это стандартная переменная окружения, её читают дочерние процессы
+WORK="$ROOT/tmp/podkop_sub"
+LOCK="$ROOT/tmp/podkop_sub.lock"
+CRON_FILE="$ROOT/etc/crontabs/root"
 CRON_MARK="# podkop_sub_sync"
 
 log() { logger -t podkop_sub -p "daemon.$1" "$2"; }
@@ -27,6 +35,13 @@ json_escape() {
 	# экранирование строки для JSON
 	sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/\\t/g' \
 		-e ':a;N;$!ba;s/\n/\\n/g'
+}
+
+# число непустых строк файла (grep -c сам печатает 0, «|| echo 0» давало «0\n0»)
+count_lines() {
+	local n
+	n=$(grep -c . "$1" 2>/dev/null)
+	echo "${n:-0}"
 }
 
 # --- запись статуса в /etc/config/podkop_sub -------------------------------
@@ -50,15 +65,29 @@ load_cfg() {
 	config_get SECTION      config section         "main"
 	config_get DEDUP        config deduplicate      "1"
 	config_get PRESERVE     config preserve_manual  "1"
+	config_get STICKY       config sticky          "1"
 	config_get CRON         config cron            "24"
 	config_get USER_AGENT   config user_agent      "v2rayNG/1.9.5"
 	config_get MANUAL       config manual_nodes    ""
 	config_list_foreach config url add_url
 }
 
+# Текущие ссылки секции podkop — по одной в строке. Через config_list_foreach,
+# а не `for l in $(uci get …)`: uci берёт элементы с пробелом в кавычки, и
+# разбиение по пробелам рвало бы такую ссылку на куски.
+CUR_FILE=""
+cur_add() { printf '%s\n' "$1" >> "$CUR_FILE"; }
+read_current_links() {
+	# $1=секция  $2=файл
+	CUR_FILE="$2"
+	: > "$CUR_FILE"
+	config_load podkop
+	config_list_foreach "$1" urltest_proxy_links cur_add
+}
+
 # каталог реестра «управляемых» ссылок (что плагин добавил в прошлый раз),
 # по файлу на секцию — чтобы при обновлении сносить только свои ноды.
-MANAGED_DIR="/etc/podkop_sub.managed.d"
+MANAGED_DIR="$ROOT/etc/podkop_sub.managed.d"
 managed_file() { echo "$MANAGED_DIR/$1"; }
 
 # Проверка зависимостей: если бинарь есть — пропускаем; если нет — ставим
@@ -77,10 +106,61 @@ check_deps() {
 	return $missing
 }
 
+# Состояние выходов sing-box (работает/нет) — из его Clash API, который включает
+# podkop (YACD). Нужен для закрепления SNI/short id у работающих нод. Если API
+# недоступен, файла не будет, и закрепление просто не применяется.
+fetch_health() {
+	# $1 = куда сохранить
+	local cfgp ctl secret
+	cfgp="$(uci -q get podkop.settings.config_path 2>/dev/null)"
+	[ -n "$cfgp" ] || cfgp="/etc/sing-box/config.json"
+	ctl="$(jsonfilter -i "$ROOT$cfgp" -e '@.experimental.clash_api.external_controller' 2>/dev/null)"
+	[ -n "$ctl" ] || return 1
+	secret="$(jsonfilter -i "$ROOT$cfgp" -e '@.experimental.clash_api.secret' 2>/dev/null)"
+	if [ -n "$secret" ]; then
+		curl -fsS --max-time 5 -H "Authorization: Bearer $secret" -o "$1" -- "http://$ctl/proxies" 2>/dev/null
+	else
+		curl -fsS --max-time 5 -o "$1" -- "http://$ctl/proxies" 2>/dev/null
+	fi
+}
+
+# --- блокировка от параллельных запусков (cron + кнопка, двойной клик) ------
+# mkdir атомарен; если владелец блокировки уже умер — считаем её брошенной.
+acquire_lock() {
+	if ! mkdir "$LOCK" 2>/dev/null; then
+		local pid
+		pid=$(cat "$LOCK/pid" 2>/dev/null)
+		if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+			return 1
+		fi
+		rm -rf "$LOCK"
+		mkdir "$LOCK" 2>/dev/null || return 1
+	fi
+	echo $$ > "$LOCK/pid"
+	return 0
+}
+release_lock() { rm -rf "$LOCK"; }
+
+# Набор нод без имён (#фрагмент) и без учёта порядка: podkop имя ноды не
+# использует, поэтому перезапуск нужен, только если изменился этот набор.
+# Публичный ключ, SNI, short id, адрес и порт — часть ссылки ДО «#», так что
+# их смена всегда считается изменением.
+links_signature() { sed 's/#.*$//' "$1" | sort -u; }
+
 # ---------------------------------------------------------------------------
 # sync
 # ---------------------------------------------------------------------------
 cmd_sync() {
+	if ! acquire_lock; then
+		log warn "sync is already running — skipped"
+		return 2
+	fi
+	trap 'release_lock; rm -rf "$WORK"' EXIT
+	trap 'exit 1' INT TERM
+	do_sync
+}
+
+do_sync() {
 	load_cfg
 
 	# (2) целевая секция должна существовать в podkop
@@ -90,17 +170,21 @@ cmd_sync() {
 		return 1
 	fi
 	# (1) режим секции: не URLTest — пишем, но предупреждаем (podkop их не читает)
-	local secwarn=""
+	local secwarn="" is_urltest=1
 	if [ "$(uci -q get "podkop.$SECTION.proxy_config_type" 2>/dev/null)" != "urltest" ]; then
+		is_urltest=0
 		secwarn="⚠ Секция '$SECTION' не в режиме URLTest — podkop не использует эти ноды. "
 		log warn "section '$SECTION' is not urltest; nodes written but ignored by podkop"
 	fi
 
-	rm -rf "$TMPDIR"
-	mkdir -p "$TMPDIR" || { log err "cannot create $TMPDIR"; return 1; }
-	local links="$TMPDIR/links.txt"
+	rm -rf "$WORK"
+	mkdir -p "$WORK" || { log err "cannot create $WORK"; return 1; }
+	local links="$WORK/links.txt"
 	: > "$links"
-	local count=0 nosub=0 persub=""
+	local count=0 nosub=0 persub="" stuck=0
+	# что сейчас записано в секции podkop (нужно и для закрепления, и для сравнения)
+	local cur="$WORK/cur.txt"
+	read_current_links "$SECTION" "$cur"
 
 	if [ -z "$(printf '%s' "$URLS" | tr -d '[:space:]')" ]; then
 		# нет ни одной подписки — это НЕ ошибка: чистим ноды подписки,
@@ -111,64 +195,79 @@ cmd_sync() {
 		# зависимости (python3/curl) нужны только когда реально качаем/парсим
 		if ! check_deps; then
 			set_status "error" "Не удалось установить зависимости (python3-light/curl)" ""
-			rm -rf "$TMPDIR"
 			return 1
 		fi
 
-		# Скачиваем каждую подписку отдельно, считаем ноды по каждой и НЕ падаем
-		# из-за одной битой — работаем с теми, что дали ноды. В persub — сводка
-		# по каждой (для UI: понятно, какая в ауте).
-		local parts="" ok=0 i=0 c
+		# Скачиваем каждую подписку отдельно и считаем ноды по каждой. В persub —
+		# сводка по каждой (для UI: понятно, какая в ауте). URL в лог не пишем:
+		# в нём токен подписки.
+		local parts="" ok=0 failed=0 i=0 c
 		local OLDIFS="$IFS"; IFS='
 '
 		for url in $URLS; do
 			[ -n "$url" ] || continue
 			i=$((i + 1))
-			local part="$TMPDIR/sub_$i.txt"
-			if curl -fsS -A "$USER_AGENT" \
-				--connect-timeout 10 --max-time 30 -o "$part" "$url"; then
-				c=$("$PYTHON" "$PARSER" "$part" 2>/dev/null | grep -c . || echo 0)
+			local part="$WORK/sub_$i.txt"
+			case "$url" in
+				http://*|https://*) ;;
+				*)
+					# не URL: строка с «-» стала бы опцией curl, file:// читал бы файлы
+					persub="$persub #$i=плохой_URL"; failed=$((failed + 1))
+					log err "subscription #$i: not an http(s) URL"
+					continue ;;
+			esac
+			if curl -fsSL --max-redirs 3 --proto '=http,https' --proto-redir '=http,https' \
+				--max-filesize 2097152 -A "$USER_AGENT" \
+				--connect-timeout 10 --max-time 30 -o "$part" -- "$url"; then
+				c=$("$PYTHON" "$PARSER" "$part" 2>/dev/null | grep -c .)
+				c="${c:-0}"
 				if [ "$c" -gt 0 ]; then
 					parts="$parts $part"; ok=$((ok + 1)); persub="$persub #$i=$c"
 				else
-					persub="$persub #$i=0(пусто)"
-					log warn "subscription #$i returned 0 nodes: $url"
+					persub="$persub #$i=0(пусто)"; failed=$((failed + 1))
+					log warn "subscription #$i returned 0 usable nodes"
 				fi
 			else
-				persub="$persub #$i=нет_сети"
-				log err "subscription #$i download failed: $url"
+				persub="$persub #$i=нет_сети"; failed=$((failed + 1))
+				log err "subscription #$i download failed"
 			fi
 		done
 		IFS="$OLDIFS"
 
-		# все подписки в ауте — fail-safe: конфиг НЕ трогаем
-		if [ "$ok" -eq 0 ]; then
-			set_status "error" "Ни одна подписка не дала нод:$persub (конфиг не изменён)" ""
-			log warn "all subscriptions failed/empty, keeping current config"
-			rm -rf "$TMPDIR"
+		# Fail-safe: если хоть одна подписка не скачалась или пуста — конфиг НЕ
+		# трогаем. Иначе ноды временно недоступной подписки были бы удалены.
+		if [ "$failed" -gt 0 ] || [ "$ok" -eq 0 ]; then
+			set_status "error" "Подписки не обновлены:$persub (конфиг не изменён)" ""
+			log warn "subscription failed/empty, keeping current config"
 			return 1
 		fi
 
 		# итоговый разбор рабочих подписок (глобальный дедуп/нумерация)
 		local pflag=""
 		[ "$DEDUP" = "0" ] && pflag="--all"
-		if ! "$PYTHON" "$PARSER" $pflag $parts > "$links" 2>"$TMPDIR/err.log"; then
-			set_status "error" "Ошибка парсера: $(cat "$TMPDIR/err.log")" ""
+		# у работающих нод оставляем прежние SNI и short id (см. podkop_sync.py)
+		local sflag=""
+		if [ "$STICKY" = "1" ] && fetch_health "$WORK/proxies.json"; then
+			sflag="--stick $cur --health $WORK/proxies.json --section $SECTION"
+		fi
+		if ! "$PYTHON" "$PARSER" $pflag $sflag $parts > "$links" 2>"$WORK/err.log"; then
+			set_status "error" "Ошибка парсера: $(tail -n 1 "$WORK/err.log")" ""
 			log err "parser failed"
-			rm -rf "$TMPDIR"
 			return 1
 		fi
-		count=$(grep -c . "$links" 2>/dev/null || echo 0)
+		count=$(count_lines "$links")
+		stuck=$(sed -n 's/^Закреплено нод: //p' "$WORK/err.log")
+		case "$stuck" in ''|*[!0-9]*) stuck=0 ;; esac
 	fi
 
 	# --- «наши» ноды: ручные из поля manual_nodes + ноды подписки ------------
-	local ourlinks="$TMPDIR/our.txt"
+	local ourlinks="$WORK/our.txt"
 	: > "$ourlinks"
 	local mcount=0 mskip=0
 	# ручные ноды: по одной vless:// в строке. Обрезаем пробелы по краям; строки
 	# с пробелом ВНУТРИ ссылки пропускаем (незакодированный фрагмент сломал бы
-	# uci-список и разбор статуса — сценарий 3).
-	printf '%s' "$MANUAL" | tr -d '\r' > "$TMPDIR/manual_raw.txt"
+	# разбор ссылки в podkop).
+	printf '%s' "$MANUAL" | tr -d '\r' > "$WORK/manual_raw.txt"
 	while IFS= read -r ml || [ -n "$ml" ]; do
 		ml=$(printf '%s' "$ml" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
 		case "$ml" in
@@ -181,21 +280,21 @@ cmd_sync() {
 						printf '%s\n' "$ml" >> "$ourlinks"; mcount=$((mcount + 1)) ;;
 				esac ;;
 		esac
-	done < "$TMPDIR/manual_raw.txt"
+	done < "$WORK/manual_raw.txt"
 	# ноды подписки
 	cat "$links" >> "$ourlinks"
 	# убрать точные дубли внутри наших нод (ручные vs подписка), ручные важнее
-	: > "$TMPDIR/our_d.txt"
+	: > "$WORK/our_d.txt"
 	while IFS= read -r line; do
 		[ -n "$line" ] || continue
-		grep -qxF "$line" "$TMPDIR/our_d.txt" && continue
-		printf '%s\n' "$line" >> "$TMPDIR/our_d.txt"
+		grep -qxF -- "$line" "$WORK/our_d.txt" && continue
+		printf '%s\n' "$line" >> "$WORK/our_d.txt"
 	done < "$ourlinks"
-	mv "$TMPDIR/our_d.txt" "$ourlinks"
+	mv "$WORK/our_d.txt" "$ourlinks"
 
-	# --- запись в podkop -------------------------------------------------
+	# --- что сейчас в podkop и что должно получиться -----------------------
 	local mf="$(managed_file "$SECTION")"
-	local keep="$TMPDIR/keep.txt"
+	local keep="$WORK/keep.txt" new="$WORK/new.txt"
 	: > "$keep"
 	local kept=0
 
@@ -203,57 +302,115 @@ cmd_sync() {
 		# сохраняем ноды секции, добавленные НЕ нами (внешние — напрямую в podkop).
 		# Реестр хранит наши прошлые ссылки; чего нет ни в реестре, ни в наших
 		# текущих нодах — считаем внешним и сохраняем.
-		for l in $(uci -q get "podkop.$SECTION.urltest_proxy_links" 2>/dev/null); do
-			[ -f "$mf" ] && grep -qxF "$l" "$mf" && continue
-			grep -qxF "$l" "$ourlinks" && continue
+		while IFS= read -r l; do
+			[ -n "$l" ] || continue
+			[ -f "$mf" ] && grep -qxF -- "$l" "$mf" && continue
+			grep -qxF -- "$l" "$ourlinks" && continue
 			printf '%s\n' "$l" >> "$keep"; kept=$((kept + 1))
-		done
+		done < "$cur"
 	fi
 
-	uci -q delete "podkop.$SECTION.urltest_proxy_links"
-	while IFS= read -r line; do
-		[ -n "$line" ] && uci add_list "podkop.$SECTION.urltest_proxy_links=$line"
-	done < "$keep"
+	cp "$keep" "$new"
 	while IFS= read -r line; do
 		[ -n "$line" ] || continue
-		grep -qxF "$line" "$keep" && continue
-		uci add_list "podkop.$SECTION.urltest_proxy_links=$line"
+		grep -qxF -- "$line" "$keep" && continue
+		printf '%s\n' "$line" >> "$new"
 	done < "$ourlinks"
 
-	if ! uci commit podkop; then
-		set_status "error" "Не удалось сохранить podkop (uci commit)" ""
-		log err "uci commit podkop failed"
-		uci -q revert podkop
-		rm -rf "$TMPDIR"
-		return 1
-	fi
-
-	# реестр = наши ноды (ручные из поля + подписка)
-	mkdir -p "$MANAGED_DIR"
-	cp "$ourlinks" "$mf"
-
-	podkop reload >/dev/null 2>&1 || podkop restart >/dev/null 2>&1
-
 	local total=$((count + mcount + kept))
-	# разбивка для плиток в UI (из подписки / вручную = поле + внешние)
-	uci -q set podkop_sub.config.last_sub="$count"
-	uci -q set podkop_sub.config.last_manual="$((mcount + kept))"
-
 	# сводка ручных: сколько пропущено из-за пробелов
 	local mnote=""
 	[ "$mskip" -gt 0 ] && mnote=" (пропущено ручных с пробелом: $mskip)"
+	local summary
+	if [ "$nosub" = 1 ]; then
+		summary="Без подписки. Вручную: $mcount, внешних: $kept, всего: $total$mnote"
+	else
+		summary="Подписки:$persub · вручную: $mcount, внешних: $kept, всего: $total$mnote"
+		[ "$stuck" -gt 0 ] && summary="$summary · SNI/short id сохранены у работающих: $stuck"
+	fi
 	# статус warn, если секция не в режиме URLTest
 	local slvl="ok"
 	[ -n "$secwarn" ] && slvl="warn"
 
-	if [ "$nosub" = 1 ]; then
-		set_status "$slvl" "${secwarn}Без подписки. Вручную: $mcount, внешних: $kept, всего: $total$mnote" "$total"
-	else
-		set_status "$slvl" "${secwarn}Подписки:$persub · вручную: $mcount, внешних: $kept, всего: $total$mnote" "$total"
+	# Пустой список в podkop писать нельзя: с ним podkop не стартует вовсе.
+	if [ "$(count_lines "$new")" -eq 0 ]; then
+		set_status "error" "Итоговый список нод пуст (конфиг не изменён). $summary" ""
+		log warn "resulting node list is empty, keeping current config"
+		return 1
 	fi
-	log info "sync ok: sub=$count manual=$mcount external=$kept total=$total in '$SECTION'"
-	rm -rf "$TMPDIR"
+
+	# Ничего не изменилось — podkop не трогаем вовсе (ни записи, ни перезапуска).
+	if cmp -s "$cur" "$new"; then
+		# Реестр всё равно сверяем: нода могла «переехать» из внешних в поле ручных
+		# (список в podkop тот же, а владелец ноды сменился).
+		cmp -s "$ourlinks" "$mf" 2>/dev/null \
+			|| { mkdir -p "$MANAGED_DIR" && cp "$ourlinks" "$mf.tmp" && mv "$mf.tmp" "$mf"; }
+		uci -q set podkop_sub.config.last_sub="$count"
+		uci -q set podkop_sub.config.last_manual="$((mcount + kept))"
+		set_status "$slvl" "${secwarn}Без изменений. $summary" "$total"
+		log info "sync ok: no changes ($total nodes) in '$SECTION'"
+		return 0
+	fi
+
+	# --- запись в podkop -------------------------------------------------
+	local werr=0
+	uci -q delete "podkop.$SECTION.urltest_proxy_links"
+	while IFS= read -r line; do
+		[ -n "$line" ] || continue
+		uci add_list "podkop.$SECTION.urltest_proxy_links=$line" || werr=1
+	done < "$new"
+
+	if [ "$werr" = 1 ] || ! uci commit podkop; then
+		uci -q revert podkop
+		set_status "error" "Не удалось сохранить podkop (конфиг не изменён)" ""
+		log err "writing podkop config failed"
+		return 1
+	fi
+
+	# реестр = наши ноды (ручные из поля + подписка); через временный файл
+	mkdir -p "$MANAGED_DIR" && cp "$ourlinks" "$mf.tmp" && mv "$mf.tmp" "$mf" \
+		|| log err "cannot update registry $mf"
+
+	uci -q set podkop_sub.config.last_sub="$count"
+	uci -q set podkop_sub.config.last_manual="$((mcount + kept))"
+
+	# --- перезапуск podkop: только если он действительно нужен -------------
+	local rnote=""
+	if [ "$(links_signature "$cur")" = "$(links_signature "$new")" ]; then
+		rnote=" Изменились только имена или порядок — podkop не перезапускался."
+		log info "only names/order changed — no podkop reload"
+	elif [ "$is_urltest" = 0 ]; then
+		rnote=""
+	elif ! "$ROOT/etc/init.d/podkop" enabled >/dev/null 2>&1; then
+		rnote=" Podkop выключен — не перезапускался."
+		log info "podkop is disabled — no reload"
+	else
+		# podkop reload = полная остановка и запуск (nft, sing-box, DNS).
+		if podkop reload >/dev/null 2>&1 && wait_singbox; then
+			rnote=" Podkop перезапущен."
+		else
+			slvl="error"
+			rnote=" Ноды записаны, но podkop не запустился — проверьте: logread -e podkop"
+			log err "podkop did not come up after reload"
+		fi
+	fi
+
+	set_status "$slvl" "${secwarn}$summary.$rnote" "$total"
+	log info "sync done: sub=$count manual=$mcount external=$kept total=$total in '$SECTION'"
+	[ "$slvl" = "error" ] && return 1
 	return 0
+}
+
+# sing-box должен подняться после reload; ждём до 20 секунд
+wait_singbox() {
+	local i=0
+	while [ $i -lt 20 ]; do
+		# pidof, а не pgrep -x: в busybox «pgrep -x sing-box» процесс не находит
+		pidof sing-box >/dev/null 2>&1 && return 0
+		sleep 1
+		i=$((i + 1))
+	done
+	return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -262,7 +419,7 @@ cmd_sync() {
 cmd_update_cron() {
 	config_load podkop_sub
 	config_get ENABLED config enabled "1"
-	config_get CRON    config cron    "0"
+	config_get CRON    config cron    "24"
 
 	local schedule=""
 	# при выключенном сервисе задачу снимаем независимо от расписания
@@ -276,21 +433,35 @@ cmd_update_cron() {
 	fi
 
 	mkdir -p "$(dirname "$CRON_FILE")"
-	touch "$CRON_FILE"
-	# удалить прежнюю строку с маркером
-	local tmp="$CRON_FILE.tmp.$$"
-	grep -v "$CRON_MARK" "$CRON_FILE" > "$tmp" 2>/dev/null
-	mv "$tmp" "$CRON_FILE"
-
-	if [ -n "$schedule" ]; then
-		echo "$schedule /usr/libexec/podkop_sub_service sync >/dev/null 2>&1 $CRON_MARK" >> "$CRON_FILE"
-		log info "cron set: $schedule"
-	else
-		log info "cron disabled"
+	[ -f "$CRON_FILE" ] || touch "$CRON_FILE"
+	# Сравниваем только СВОЮ строку, а не файл целиком: podkop при каждом
+	# перезапуске переставляет свои строки, и порядок в файле меняется.
+	local want=""
+	[ -n "$schedule" ] && want="$schedule /usr/libexec/podkop_sub_service sync >/dev/null 2>&1 $CRON_MARK"
+	if [ "$(grep -F "$CRON_MARK" "$CRON_FILE" 2>/dev/null)" = "$want" ]; then
+		return 0                # уже как надо — crontab и cron не трогаем
 	fi
+	# новая версия файла: всё, кроме нашей строки, плюс (если нужно) наша строка
+	local tmp="$CRON_FILE.tmp.$$" rc
+	grep -v "$CRON_MARK" "$CRON_FILE" > "$tmp" 2>/dev/null
+	rc=$?
+	# grep: 0 — строки есть, 1 — чужих строк нет; всё прочее — ошибка чтения/записи.
+	# При ошибке crontab не трогаем, иначе потеряли бы чужие задачи.
+	if [ "$rc" -gt 1 ]; then
+		rm -f "$tmp"
+		log err "cannot rewrite $CRON_FILE — left untouched"
+		return 1
+	fi
+	if [ -n "$want" ]; then
+		echo "$want" >> "$tmp" || { rm -f "$tmp"; log err "cannot write $tmp"; return 1; }
+	fi
+	# cat, а не mv: сохраняем владельца и права существующего файла
+	cat "$tmp" > "$CRON_FILE"
+	rm -f "$tmp"
+	[ -n "$schedule" ] && log info "cron set: $schedule" || log info "cron disabled"
 
-	/etc/init.d/cron enable  >/dev/null 2>&1
-	/etc/init.d/cron restart >/dev/null 2>&1
+	"$ROOT/etc/init.d/cron" enable  >/dev/null 2>&1
+	"$ROOT/etc/init.d/cron" restart >/dev/null 2>&1
 }
 
 # ---------------------------------------------------------------------------
@@ -308,21 +479,26 @@ cmd_status() {
 
 	# Собираем ноды секции и считаем РЕАЛЬНОЕ количество (а не сохранённое
 	# last_count) — так счётчик всегда совпадает с таблицей.
-	# uci get для списка отдаёт элементы через пробел; в наших ссылках
-	# пробелов нет (фрагмент полностью percent-encoded), поэтому split безопасен.
 	# Разбор ссылки на имя/протокол/хост/порт делает main.js (decodeURIComponent).
-	local nodes_json="" cnt=0 link
-	for link in $(uci -q get "podkop.$SECTION.urltest_proxy_links" 2>/dev/null); do
-		case "$link" in
+	local nodes_json="" cnt=0
+	status_add() {
+		case "$1" in
 			vless://*) ;;
-			*) continue ;;
+			*) return 0 ;;
 		esac
 		[ -n "$nodes_json" ] && nodes_json="$nodes_json,"
-		nodes_json="$nodes_json\"$(printf '%s' "$link" | json_escape)\""
+		nodes_json="$nodes_json\"$(printf '%s' "$1" | json_escape)\""
 		cnt=$((cnt + 1))
-	done
+	}
+	config_load podkop
+	config_list_foreach "$SECTION" urltest_proxy_links status_add
+	# числа вставляются в JSON без кавычек — не даём мусору из конфига сломать ответ
+	case "$up"  in ''|*[!0-9]*) up=0 ;;  esac
+	case "$sub" in ''|*[!0-9]*) sub=0 ;; esac
+	case "$man" in ''|*[!0-9]*) man=0 ;; esac
 
-	printf '{"status":"%s","message":"%s","last_update":%s,"count":%s,"sub":%s,"manual":%s,"section":"%s","nodes":[%s]}\n' \
+	printf '{"version":"%s","status":"%s","message":"%s","last_update":%s,"count":%s,"sub":%s,"manual":%s,"section":"%s","nodes":[%s]}\n' \
+		"$VERSION" \
 		"$(printf '%s' "$st" | json_escape)" \
 		"$(printf '%s' "$ms" | json_escape)" \
 		"${up:-0}" "$cnt" "${sub:-0}" "${man:-0}" "$(printf '%s' "$SECTION" | json_escape)" \

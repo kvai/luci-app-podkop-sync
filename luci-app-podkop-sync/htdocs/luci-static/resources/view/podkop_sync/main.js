@@ -10,10 +10,15 @@
 var callSync = rpc.declare({ object: 'luci.podkop_sub', method: 'sync' });
 var callStatus = rpc.declare({ object: 'luci.podkop_sub', method: 'status' });
 
+/* ВАЖНО: данные из подписки и статуса передаём в E() только МАССИВОМ детей.
+   Строка третьим аргументом уходит в innerHTML, и имя/хост ноды из чужой
+   подписки исполнились бы как HTML в сессии администратора (XSS). */
+
 /* Разбор vless:// ссылки для таблицы (имя/протокол/сеть/хост/порт).
    Полностью percent-encoded фрагмент декодируется здесь. */
 function parseVless(link) {
-	var m = /^vless:\/\/([^@]+)@(.+):(\d+)(?:\?([^#]*))?(?:#(.*))?$/i.exec(link);
+	/* хост не содержит «:» — иначе «:цифры» в имени ноды принимались бы за порт */
+	var m = /^vless:\/\/([^@]+)@([^:\/?#]+):(\d+)\/?(?:\?([^#]*))?(?:#(.*))?$/i.exec(link);
 	if (!m)
 		return null;
 
@@ -59,7 +64,8 @@ var PKS_CSS =
 	'.pks-pill{font-size:12px;opacity:.85;background:rgba(128,128,128,.15);border-radius:20px;padding:2px 9px}' +
 	'.pks-flt{margin-left:auto}' +
 	'.pks-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin:.2rem 0 1.1rem}' +
-	'.pks-head h2{margin:0}' +
+	'.pks-head h2{margin:0;display:flex;align-items:center;gap:10px}' +
+	'.pks-ver{font-size:12px;font-weight:400;line-height:1.4;color:#fff;background:tomato;border:1px solid tomato;border-radius:5px;padding:1px 6px}' +
 	'.pks-card{border:1px solid rgba(128,128,128,.2);border-radius:10px;background:rgba(128,128,128,.04);padding:14px 16px;margin:0 0 14px}' +
 	'.pks-card>.pks-bar{border-bottom:1px solid rgba(128,128,128,.2);padding-bottom:10px;margin:0 0 4px}' +
 	'.pks-card .pks-tiles{margin:0 0 .5rem}' +
@@ -95,8 +101,8 @@ var PKS_CSS =
 
 function pksTile(label, val) {
 	return E('div', { 'class': 'pks-tile' }, [
-		E('div', { 'class': 'l' }, label),
-		E('div', { 'class': 'v' }, val)
+		E('div', { 'class': 'l' }, [ label ]),
+		E('div', { 'class': 'v' }, [ String(val) ])
 	]);
 }
 
@@ -112,11 +118,11 @@ function renderStatusInner(st) {
 			pksTile(_('Из подписки'), String(st.sub || 0)),
 			pksTile(_('Вручную'), String(st.manual || 0)),
 			E('div', { 'class': 'pks-tile' }, [
-				E('div', { 'class': 'l' }, _('Статус')),
+				E('div', { 'class': 'l' }, [ _('Статус') ]),
 				E('div', { 'class': 'v', 'style': 'font-size:15px;display:flex;align-items:center;gap:7px' }, [
 					E('span', { 'class': 'pks-dot', 'style': 'background:' + color }), label
 				]),
-				E('div', { 'style': 'font-size:11px;opacity:.7;margin-top:2px' }, fmtTime(st.last_update))
+				E('div', { 'style': 'font-size:11px;opacity:.7;margin-top:2px' }, [ String(fmtTime(st.last_update)) ])
 			])
 		]),
 		E('div', { 'class': 'pks-cap' }, [
@@ -135,13 +141,13 @@ function renderNodesPanel(nodes) {
 		var proto = n.proto.replace('VLESS · ', '');
 		tbody.appendChild(E('tr', {}, [
 			E('td', {}, [ E('span', { 'class': 'pks-dot', 'style': 'background:#3fb950' }), n.name ]),
-			E('td', {}, E('span', { 'class': 'pks-chip' }, proto + ' · ' + n.net.toUpperCase())),
-			E('td', { 'class': 'pks-mono' }, n.host),
-			E('td', { 'class': 'pks-mono pks-r' }, n.port)
+			E('td', {}, [ E('span', { 'class': 'pks-chip' }, [ proto + ' · ' + String(n.net).toUpperCase() ]) ]),
+			E('td', { 'class': 'pks-mono' }, [ String(n.host) ]),
+			E('td', { 'class': 'pks-mono pks-r' }, [ String(n.port) ])
 		]));
 	});
 
-	var cntPill = E('span', { 'class': 'pks-pill' }, String(tbody.children.length));
+	var cntPill = E('span', { 'class': 'pks-pill' }, [ String(tbody.children.length) ]);
 	var filter = E('input', {
 		'type': 'text', 'class': 'cbi-input-text pks-flt',
 		'placeholder': _('Фильтр по имени или хосту'),
@@ -239,6 +245,14 @@ return view.extend({
 		o = s.option(form.Flag, 'deduplicate', _('Удалять дубликаты серверов'));
 		o.default = '1';
 
+		o = s.option(form.Flag, 'sticky', _('Не менять SNI и short id у работающих нод'),
+			_('Панели вроде 3x-ui при каждом скачивании подписки выдают случайные SNI и ' +
+			  'short id из списков ноды. Вкл — у ноды, которая сейчас работает, они ' +
+			  'остаются прежними, и podkop не перезапускается без нужды; у неработающей ' +
+			  'берутся свежие из подписки. Нужен включённый YACD в настройках podkop.'));
+		o.default = '1';
+		o.rmempty = false;
+
 		o = s.option(form.Flag, 'preserve_manual', _('Сохранять внешние ноды'),
 			_('Сохранять ноды, добавленные в секцию напрямую в podkop (не через ' +
 			  'поле выше). Выкл — секция = только ручные ноды из поля + подписка.'));
@@ -308,12 +322,12 @@ return view.extend({
 				if (old && old.parentNode) old.parentNode.replaceChild(newNodes, old);
 
 				if (res.status === 'ok')
-					ui.addNotification(null, E('p', _('Обновлено: %s нод.').format(res.count || 0)), 'info');
+					ui.addNotification(null, E('p', {}, [ String(res.message || _('Обновлено: %s нод.').format(res.count || 0)) ]), 'info');
 				else
-					ui.addNotification(null, E('p', String(res.message || _('Обновление не удалось.'))), 'danger');
+					ui.addNotification(null, E('p', {}, [ String(res.message || _('Обновление не удалось.')) ]), 'danger');
 			}).catch(function(e) {
 				ui.hideModal();
-				ui.addNotification(null, E('p', _('Обновление не удалось') + ': ' + e), 'danger');
+				ui.addNotification(null, E('p', {}, [ _('Обновление не удалось') + ': ' + e ]), 'danger');
 			});
 		}
 
@@ -321,7 +335,10 @@ return view.extend({
 			E('style', {}, PKS_CSS),
 			E('div', { 'class': 'pks-head' }, [
 				E('div', {}, [
-					E('h2', {}, 'Podkop Sync'),
+					E('h2', {}, [
+						'Podkop Sync',
+						status.version ? E('span', { 'class': 'pks-ver', 'title': _('Версия плагина') }, [ 'v' + String(status.version) ]) : ''
+					]),
 					E('div', { 'class': 'pks-cap', 'style': 'margin:2px 0 0' },
 						_('Подписки и ручные ноды → секция podkop (URLTest).'))
 				]),

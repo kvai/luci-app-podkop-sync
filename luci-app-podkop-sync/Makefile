@@ -5,7 +5,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-podkop-sync
-PKG_VERSION:=1.0.0
+PKG_VERSION:=1.1.0
 PKG_RELEASE:=1
 
 PKG_MAINTAINER:=htckvai <htckvai@gmail.com>
@@ -15,11 +15,20 @@ LUCI_TITLE:=LuCI app to sync proxy subscriptions into Podkop (URLTest)
 LUCI_DEPENDS:=+python3-light +curl +podkop
 LUCI_PKGARCH:=all
 
+# Настройки пользователя (URL подписок, ручные ноды) — conffile: без этого
+# объявления opkg при обновлении пакета перезаписывал бы их умолчаниями.
+define Package/luci-app-podkop-sync/conffiles
+/etc/config/podkop_sub
+endef
+
 # Чистое удаление: снять cron-задачу, отключить сервис, убрать реестр.
 # Выполняется на устройстве при `opkg remove` (не при сборке образа).
+# При ОБНОВЛЕНИИ opkg тоже зовёт prerm (с аргументом upgrade) — тогда ничего
+# не трогаем, иначе пропал бы реестр своих нод и cron-задача.
 define Package/luci-app-podkop-sync/prerm
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT}" ] && exit 0
+[ "$$1" = "upgrade" ] && exit 0
 # disable only — сервис демона не держит (procd reload-триггер), поэтому
 # 'stop' лишь дёргает 'ubus service delete' и шумит 'Not found' при удалении.
 /etc/init.d/podkop_sub disable 2>/dev/null
@@ -32,6 +41,5 @@ endef
 include $(TOPDIR)/feeds/luci/luci.mk
 
 # luci.mk автоматически устанавливает ./htdocs -> /www и ./root -> /
-# /etc/config/podkop_sub попадает в conffiles автоматически (сохраняется при
-# обновлении, удаляется только при opkg remove --autoremove/purge).
+# /etc/config/podkop_sub объявлен в conffiles выше: сохраняется при обновлении.
 # call BuildPackage - OpenWrt buildroot signature

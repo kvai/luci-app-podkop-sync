@@ -17,7 +17,13 @@ if [ "$MODE" = "ui" ]; then
 	scp -O "$D/htdocs/luci-static/resources/view/podkop_sync/main.js" \
 		root@"$R":/www/luci-static/resources/view/podkop_sync/main.js
 else
-	scp -O -r "$D/root/"* root@"$R":/
+	# Через tar с исключениями, а не scp -r: иначе на роутер уезжал бы
+	# etc/config/podkop_sub с умолчаниями и затирал URL подписок и ручные ноды.
+	# uci-defaults тоже не везём: он для первой установки пакета. COPYFILE_DISABLE —
+	# чтобы macOS-tar не клал на роутер служебные файлы «._*».
+	COPYFILE_DISABLE=1 tar -C "$D/root" --exclude='./etc/config' --exclude='./etc/uci-defaults' \
+		--exclude='__pycache__' --exclude='.DS_Store' -cf - . \
+		| ssh -o RemoteCommand=none root@"$R" 'tar -C / -xf -'
 	scp -O -r "$D/htdocs/luci-static" root@"$R":/www/
 	ssh -o RemoteCommand=none root@"$R" '
 		chmod +x /usr/bin/podkop_sync.py /usr/libexec/podkop_sub_service \

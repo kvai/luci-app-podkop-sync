@@ -3,7 +3,7 @@
 		"description": "Grant access to Podkop Sync",
 		"read": {
 			"ubus": {
-				"luci.podkop_sub": [ "status", "sync", "update_cron" ]
+				"luci.podkop_sub": [ "status" ]
 			},
 			"uci": [ "podkop_sub", "podkop" ]
 		},
@@ -11,7 +11,7 @@
 			"ubus": {
 				"luci.podkop_sub": [ "sync", "update_cron" ]
 			},
-			"uci": [ "podkop_sub", "podkop" ]
+			"uci": [ "podkop_sub" ]
 		}
 	}
 }

@@ -636,7 +636,17 @@ class VersionTests(SyncEnv):
         with open(os.path.join(HERE, "..", "luci-app-podkop-sync", "Makefile"), encoding="utf-8") as f:
             mk = [l.split(":=")[1].strip() for l in f if l.startswith("PKG_VERSION:=")][0]
         st = json.loads(self.run_svc("status").stdout)
-        self.assertEqual(st["version"], mk, "VERSION в podkop_sub_service должна совпадать с PKG_VERSION")
+        self.assertEqual(st["version"], mk + "-dev", "VERSION в podkop_sub_service должна совпадать с PKG_VERSION")
+
+    def test_ci_build_number_is_shown(self):
+        """Сборка на GitHub подставляет номер запуска той же командой sed, что в build.yml."""
+        with open(SERVICE, encoding="utf-8") as f:
+            src = f.read()
+        self.assertEqual(src.count('\nRELEASE="dev"\n'), 1)
+        stamped = os.path.join(self.root, "svc_stamped")
+        self._script(stamped, src.replace('\nRELEASE="dev"\n', '\nRELEASE="57"\n'))
+        out = subprocess.run(["sh", stamped, "status"], env=self.env, capture_output=True, text=True).stdout
+        self.assertTrue(json.loads(out)["version"].endswith("-r57"), out)
 
 
 class CronTests(SyncEnv):

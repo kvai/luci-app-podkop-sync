@@ -16,6 +16,10 @@ ROOT="${PODKOP_SUB_ROOT:-}"
 # Версия плагина (показывается в LuCI). Должна совпадать с PKG_VERSION в
 # Makefile — за этим следит tests/test_sync.py.
 VERSION="1.1.0"
+# Номер сборки: GitHub Actions подставляет сюда и в PKG_RELEASE порядковый номер
+# запуска, чтобы каждая сборка была «новее» предыдущей и opkg обновлял пакет
+# поверх без удаления. «dev» — файлы выложены вручную (dev-deploy.sh).
+RELEASE="dev"
 . "$ROOT/lib/functions.sh"
 
 # rpcd/cron запускают нас с урезанным PATH — задаём явно и резолвим python.
@@ -498,7 +502,7 @@ cmd_status() {
 	case "$man" in ''|*[!0-9]*) man=0 ;; esac
 
 	printf '{"version":"%s","status":"%s","message":"%s","last_update":%s,"count":%s,"sub":%s,"manual":%s,"section":"%s","nodes":[%s]}\n' \
-		"$VERSION" \
+		"$VERSION-$([ "$RELEASE" = dev ] && echo dev || echo "r$RELEASE")" \
 		"$(printf '%s' "$st" | json_escape)" \
 		"$(printf '%s' "$ms" | json_escape)" \
 		"${up:-0}" "$cnt" "${sub:-0}" "${man:-0}" "$(printf '%s' "$SECTION" | json_escape)" \

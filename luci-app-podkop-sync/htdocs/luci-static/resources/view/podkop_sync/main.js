@@ -64,8 +64,12 @@ var PKS_CSS =
 	'.pks-pill{font-size:12px;opacity:.85;background:rgba(128,128,128,.15);border-radius:20px;padding:2px 9px}' +
 	'.pks-flt{margin-left:auto}' +
 	'.pks-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin:.2rem 0 1.1rem}' +
-	'.pks-head h2{margin:0;display:flex;align-items:center;gap:10px}' +
-	'.pks-ver{font-size:12px;font-weight:400;line-height:1.4;color:#fff;background:tomato;border:1px solid tomato;border-radius:5px;padding:1px 6px}' +
+	/* Значок версии: flex центрирует по строке заголовка, а буквы заголовка из-за места под
+	   выносные элементы (р, у) зрительно стоят выше её середины. Поэтому строку заголовка
+	   поджимаем (line-height:1) и поднимаем значок на 0.06em от размера шрифта заголовка. */
+	'.pks-head h2{margin:0;padding:0;line-height:1;display:flex;align-items:center;gap:10px}' +
+	'.pks-ver{font-size:12px;font-weight:400;line-height:1;color:#fff;background:tomato;border:1px solid tomato;border-radius:5px;padding:3px 6px;white-space:nowrap}' +
+	'.pks-ver-wrap{display:inline-flex;position:relative;top:-.06em}' +
 	'.pks-card{border:1px solid rgba(128,128,128,.2);border-radius:10px;background:rgba(128,128,128,.04);padding:14px 16px;margin:0 0 14px}' +
 	'.pks-card>.pks-bar{border-bottom:1px solid rgba(128,128,128,.2);padding-bottom:10px;margin:0 0 4px}' +
 	'.pks-card .pks-tiles{margin:0 0 .5rem}' +
@@ -337,7 +341,9 @@ return view.extend({
 				E('div', {}, [
 					E('h2', {}, [
 						'Podkop Sync',
-						status.version ? E('span', { 'class': 'pks-ver', 'title': _('Версия плагина') }, [ 'v' + String(status.version) ]) : ''
+						status.version ? E('span', { 'class': 'pks-ver-wrap' }, [
+							E('span', { 'class': 'pks-ver', 'title': _('Версия плагина') }, [ 'v' + String(status.version) ])
+						]) : ''
 					]),
 					E('div', { 'class': 'pks-cap', 'style': 'margin:2px 0 0' },
 						_('Подписки и ручные ноды → секция podkop (URLTest).'))

@@ -24,7 +24,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # Тесты идут ДО подстановки номера сборки: они проверяют исходники как есть.
       - name: Run tests
@@ -65,7 +65,7 @@ jobs:
           [ -n "$ipk" ] && cp -v "$ipk" artifacts/luci-app-podkop-sync.ipk
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: luci-app-podkop-sync-${{ matrix.arch }}
           path: artifacts/*
@@ -75,7 +75,7 @@ jobs:
       # чтобы install.sh качал его по постоянному URL.
       - name: Publish rolling release 'latest'
         if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: latest
           name: latest

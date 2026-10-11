@@ -235,6 +235,91 @@ o, e = run_main(tf.name)
 check("transports: no filter without the option", o.count("vless://") == 4)
 os.unlink(tf.name)
 
+# 19) один сервер, пришедший дважды с разными SNI (отдельно и в «авто»-группе), — одна нода
+twice = ("vless://u-1@h1.example:443?pbk=K1&security=reality&sid=s1&sni=aaa.example&type=tcp#Авто\n"
+         "vless://u-1@h1.example:443?pbk=K1&security=reality&sid=s2&sni=bbb.example&type=tcp#Польша\n"
+         "vless://u-1@h2.example:443?pbk=K2&security=reality&sid=s3&sni=ccc.example&type=tcp#Другая\n")
+dd = ps.render_links(ps.parse_input(twice))
+check("dedup: same server with different sni is one node", len(dd) == 2 and "h1.example" in dd[0], str(dd))
+check("--all keeps both copies", len(ps.render_links(ps.parse_input(twice), deduplicate=False)) == 3)
+# закрепление: обе копии получают SNI работающей текущей ноды, список не растёт
+cur_one = ["vless://u-1@h1.example:443?pbk=K1&security=reality&sid=s0&sni=old.example&type=tcp#Авто"]
+fresh3 = ps.parse_input(twice)
+k3 = ps.apply_sticky(fresh3, cur_one, {"main-1-out": True}, "main")
+out3 = ps.render_links(fresh3)
+check("sticky: copies of one server collapse to the current link",
+      len(out3) == 2 and "sni=old.example" in out3[0] and "sid=s0" in out3[0] and k3 == 2, str(out3))
+# если в текущем списке уже накопились две копии сервера — следующий разбор сводит их к одной
+cur_two = ["vless://u-1@h1.example:443?pbk=K1&security=reality&sid=s0&sni=old.example&type=tcp#Авто",
+           "vless://u-1@h1.example:443?pbk=K1&security=reality&sid=s9&sni=zzz.example&type=tcp#Польша"]
+fresh4 = ps.parse_input(twice)
+ps.apply_sticky(fresh4, cur_two, {"main-1-out": True, "main-2-out": True}, "main")
+out4 = ps.render_links(fresh4)
+check("sticky: accumulated duplicates heal on next sync", len(out4) == 2 and "h1.example" in out4[0], str(out4))
+# и результат устойчив: следующий разбор от уже «вылеченного» списка ничего не меняет
+fresh5 = ps.parse_input(twice)
+ps.apply_sticky(fresh5, out4, {"main-1-out": True, "main-2-out": True}, "main")
+ps.keep_current_order(fresh5, out4)
+check("sticky: healed list is a fixed point", ps.render_links(fresh5) == out4, str(ps.render_links(fresh5)))
+
+# 20) порядок: панель перемешала серверы — в podkop они остаются на своих местах;
+#     новая нода встаёт за той, за которой шла в подписке
+cur_ord = ["vless://u-1@h1.example:443?pbk=K1&security=reality&sid=s0&sni=a.example&type=tcp#Один",
+           "vless://u-1@h2.example:443?pbk=K2&security=reality&sid=s0&sni=b.example&type=tcp#Два"]
+shuffled = ps.parse_input("vless://u-1@h2.example:443?pbk=K2&security=reality&sid=x&sni=zz.example&type=tcp#Два\n"
+                          "vless://u-1@h3.example:443?pbk=K3&security=reality&sid=x&sni=c.example&type=tcp#Три\n"
+                          "vless://u-1@h1.example:443?pbk=K1&security=reality&sid=x&sni=yy.example&type=tcp#Один\n")
+ps.apply_sticky(shuffled, cur_ord, {"main-1-out": True, "main-2-out": True}, "main")
+ps.keep_current_order(shuffled, cur_ord)
+o20 = ps.render_links(shuffled)
+check("order: current order kept, new node follows its neighbour",
+      [l.split("@")[1].split(":")[0] for l in o20] == ["h1.example", "h2.example", "h3.example"], str(o20))
+check("order+sticky: unchanged nodes are byte-identical to current",
+      o20[:2] == ps.render_links(ps.parse_input("\n".join(cur_ord))), str(o20[:2]))
+# 21) sing-box только что запущен: истории нет, но ноды не считаем сломанными
+fresh21 = ps.parse_input("vless://u-1@h1.example:443?pbk=K1&security=reality&sid=x&sni=yy.example&type=tcp#Один")
+k21 = ps.apply_sticky(fresh21, cur_ord, {}, "main", assume_working=True)
+check("assume_working: keeps current values without health data",
+      k21 == 1 and "sni=a.example" in ps.render_links(fresh21)[0])
+
+# 22) из копий одного сервера остаётся та, у которой имя уникально, в любом порядке выдачи
+auto_first = ("vless://u-1@h1.example:443?pbk=K1&security=reality&sni=a.example&type=tcp#Авто\n"
+              "vless://u-1@h2.example:443?pbk=K2&security=reality&sni=b.example&type=tcp#Авто\n"
+              "vless://u-1@h1.example:443?pbk=K1&security=reality&sni=c.example&type=tcp#Польша\n")
+country_first = "\n".join(reversed(auto_first.strip().split("\n")))
+n_a = [ps.unq(l.split("#")[1], plus=False) for l in ps.render_links(ps.parse_input(auto_first))]
+n_c = [ps.unq(l.split("#")[1], plus=False) for l in ps.render_links(ps.parse_input(country_first))]
+check("dedup: unique name wins over group name", sorted(n_a) == sorted(n_c) == ["Авто", "Польша"], "%s / %s" % (n_a, n_c))
+# 23) нода, которая не работала и в прошлый раз, повторно не обновляется
+cur23 = ["vless://u-1@h1.example:443?pbk=K1&security=reality&sid=s0&sni=old.example&type=tcp#A"]
+def fresh23(): return ps.parse_input("vless://u-1@h1.example:443?pbk=K1&security=reality&sid=zz&sni=new.example&type=tcp#A")
+dead = []
+f1 = fresh23(); ps.apply_sticky(f1, cur23, {"main-1-out": False, "x": True}, "main", dead_out=dead)
+check("dead: first time takes fresh values", "sni=new.example" in ps.render_links(f1)[0] and len(dead) == 1)
+f2 = fresh23(); k = ps.apply_sticky(f2, cur23, {"main-1-out": False, "x": True}, "main", frozen=set(dead), dead_out=[])
+check("dead: second time keeps current values (no churn)", "sni=old.example" in ps.render_links(f2)[0] and k == 1)
+check("dead: key file format matches key_of_link", dead[0] == ps.key_of_link(cur23[0]))
+
+# 24) две копии сервера с одинаково редкими именами: выбор не зависит от порядка
+tie = ("vless://u-1@h1.example:443?pbk=K1&security=reality&sni=a.example&type=tcp#Заголовок\n"
+       "vless://u-1@h1.example:443?pbk=K1&security=reality&sni=c.example&type=tcp#Швейцария\n")
+t1 = ps.render_links(ps.parse_input(tie))[0].split("#")[1]
+t2 = ps.render_links(ps.parse_input("\n".join(reversed(tie.strip().split("\n")))))[0].split("#")[1]
+check("dedup: tie between equally rare names is order-independent", t1 == t2, "%s / %s" % (t1, t2))
+
+# 25) сервер из одиночного профиля и он же как «приманка» в группе-балансировщике:
+#     имя берётся из одиночного профиля, в любом порядке выдачи
+def prof(name, hosts):
+    return {"remarks": name, "outbounds": [{"protocol": "vless", "settings": {"vnext": [
+        {"address": h, "port": 443, "users": [{"id": "u-1"}]}]},
+        "streamSettings": {"network": "tcp", "security": "reality", "realitySettings": {"publicKey": "K" + h, "serverName": "x.example"}}}
+        for h in hosts]}
+solo, group = prof("Швеция", ["h1.example"]), prof("Турция (БС-4)", ["h1.example", "h9.example"])
+for label, data in (("group first", [group, solo]), ("solo first", [solo, group])):
+    names = sorted(ps.unq(l.split("#")[1], plus=False) for l in ps.render_links(ps.nodes_from_json(data)))
+    check("dedup: single-server profile name wins (%s)" % label, names == ["Турция (БС-4)", "Швеция"]
+          and any("h1.example" in l and l.endswith(ps.encode_fragment("Швеция")) for l in ps.render_links(ps.nodes_from_json(data))), str(names))
+
 print()
 print("FAILURES:", failures)
 sys.exit(1 if failures else 0)

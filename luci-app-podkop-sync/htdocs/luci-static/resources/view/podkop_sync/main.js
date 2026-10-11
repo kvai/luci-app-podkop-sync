@@ -315,9 +315,26 @@ return view.extend({
 			}).then(function() {
 				try { ui.changes.renderChangeIndicator(); } catch (e) {}
 				ui.showModal(_('Обновление подписок…'), [
-					E('p', { 'class': 'spinning' }, _('Скачивание и разбор, подождите…'))
+					E('p', { 'class': 'spinning', 'id': 'pks-sync-note' }, _('Скачивание и разбор, подождите…'))
 				]);
 				return callSync();
+			}).then(function(res) {
+				/* Синхронизация идёт на роутере отдельным процессом. Если она не успела
+				   за первые секунды (проверка конфига, перезапуск podkop — это до минуты),
+				   бэкенд отвечает running:true, и мы опрашиваем статус, пока она не
+				   закончится. Каждый запрос короткий, поэтому таймаут LuCI не срабатывает.
+				   Во время перезапуска podkop отдельные запросы могут не пройти — это не
+				   ошибка, просто спрашиваем ещё раз. */
+				function waitFinish(res, left) {
+					if (!res || !res.running || left <= 0)
+						return res;
+					dom.content(document.getElementById('pks-sync-note'),
+						_('Проверка и применение нового списка, podkop может перезапускаться. Обычно до минуты…'));
+					return new Promise(function(resolve) { window.setTimeout(resolve, 3000); })
+						.then(function() { return callStatus().catch(function() { return { running: true }; }); })
+						.then(function(st) { return waitFinish(st, left - 1); });
+				}
+				return waitFinish(res || {}, 60);
 			}).then(function(res) {
 				ui.hideModal();
 				res = res || {};
@@ -328,7 +345,7 @@ return view.extend({
 				if (old && old.parentNode) old.parentNode.replaceChild(newNodes, old);
 
 				if (res.running)
-					ui.addNotification(null, E('p', {}, [ _('Синхронизация ещё выполняется: podkop перезапускается. Обновите страницу через минуту, чтобы увидеть результат.') ]), 'info');
+					ui.addNotification(null, E('p', {}, [ _('Синхронизация всё ещё выполняется. Обновите страницу через минуту, чтобы увидеть результат.') ]), 'info');
 				else if (res.status === 'ok')
 					ui.addNotification(null, E('p', {}, [ String(res.message || _('Обновлено: %s нод.').format(res.count || 0)) ]), 'info');
 				else

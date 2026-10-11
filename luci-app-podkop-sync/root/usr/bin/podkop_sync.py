@@ -110,6 +110,12 @@ def build_query(params):
 # }
 
 def _node_signature(node):
+    """Что считать «тем же сервером» при удалении дубликатов.
+
+    SNI сюда не входит: панели выдают его случайно из списка, и одна и та же
+    нода может прийти дважды с разными SNI (например, отдельной строкой и в
+    составе «авто»-группы) — это один сервер, а не два.
+    """
     p = node["params"]
     return (
         node["address"],
@@ -117,7 +123,6 @@ def _node_signature(node):
         p.get("type", "tcp"),
         p.get("security", "none"),
         p.get("pbk", ""),
-        p.get("sni", ""),
         p.get("path", p.get("serviceName", "")),
     )
 
@@ -264,10 +269,16 @@ def nodes_from_json(data):
         if not isinstance(item, dict):
             continue
         remark = item.get("remarks", "Server")
-        for ob in item.get("outbounds", []):
+        found = []
+        for ob in item.get("outbounds", []) or []:
             node = node_from_outbound(ob, remark)
             if node:
-                nodes.append(node)
+                found.append(node)
+        # Профиль с несколькими серверами — это группа (автовыбор, балансировщик):
+        # его название относится к группе, а не к каждому серверу в ней.
+        for node in found:
+            node["group_size"] = len(found)
+        nodes.extend(found)
     return nodes
 
 
@@ -420,32 +431,89 @@ def load_health(path):
         return None
 
 
-def apply_sticky(nodes, current_links, health, section):
-    """Вернуть число нод, которым оставлены прежние SNI/short id (nodes правится на месте)."""
-    if not health:
-        return 0
-    working = []
-    for i, link in enumerate(current_links, 1):
-        # podkop называет выходы <секция>-<номер ссылки>-out
-        if not health.get("%s-%d-out" % (section, i)):
-            continue
+def keep_current_order(nodes, current_links):
+    """Расставить ноды в том порядке, в каком они уже стоят в podkop.
+
+    Некоторые панели при каждом скачивании перемешивают серверы. Без этого список
+    в podkop переписывался бы при каждой синхронизации, а нумерация одноимённых
+    нод (#1, #2) прыгала бы. Новая нода (или нода, у которой сменился адрес/ключ)
+    встаёт сразу после той, за которой она шла в подписке.
+    """
+    position = {}
+    for i, link in enumerate(current_links):
         cur = node_from_uri(link)
         if cur:
-            working.append(cur)
-    used, kept = set(), 0
+            position.setdefault(sticky_key(cur), i)
+    place, last = {}, -1.0
+    for n in nodes:
+        pos = position.get(sticky_key(n))
+        if pos is None:
+            pos = last + 0.5        # новая: держится за своей соседкой по подписке
+        else:
+            last = float(pos)
+        place[id(n)] = pos
+    # сортировка устойчивая: ноды с одинаковым местом сохраняют взаимный порядок
+    nodes.sort(key=lambda n: place[id(n)])
+
+
+def key_of_link(link):
+    """Ключ ноды по ссылке, строкой (для файлов состояния); None для негодной ссылки."""
+    node = node_from_uri(link)
+    return repr(sticky_key(node)) if node else None
+
+
+def apply_sticky(nodes, current_links, health, section, assume_working=False,
+                 frozen=None, dead_out=None, retry_own=False):
+    """Вернуть число нод, которым оставлены прежние SNI/short id (nodes правится на месте).
+
+    assume_working: данных о здоровье ещё нет (sing-box только что запущен) —
+    считаем все текущие ноды работающими, чтобы не менять их вслепую.
+    frozen: ключи нод, которые не работали и в прошлый раз, хотя им уже выдавали
+    свежие значения. Повторно их не трогаем: иначе нода, которая просто лежит,
+    получала бы новый случайный SNI при каждой синхронизации, и список менялся
+    бы вечно. Новая попытка — по кнопке в интерфейсе.
+    dead_out: сюда (если передан список) кладутся ключи неработающих сейчас нод.
+    retry_own: человек нажал «обновить»: «своим» неработающим нодам (первая
+    подписка) даём свежие значения ещё раз. Ноды дополнительных подписок по
+    кнопке не трогаем — иначе чужие лежащие серверы вызывали бы перезапуск при
+    каждом нажатии.
+    """
+    if not health and not assume_working:
+        return 0
+    health = health or {}
+    frozen = frozen or set()
+    own = set(repr(sticky_key(n)) for n in nodes if n.get("source", 1) <= 1)
+    working = defaultdict(list)     # ключ ноды -> работающие текущие ноды с таким ключом
+    for i, link in enumerate(current_links, 1):
+        # podkop называет выходы <секция>-<номер ссылки>-out
+        cur = node_from_uri(link)
+        if not cur:
+            continue
+        if not assume_working and not health.get("%s-%d-out" % (section, i)):
+            key_text = repr(sticky_key(cur))
+            if dead_out is not None:
+                dead_out.append(key_text)
+            if key_text not in frozen or (retry_own and key_text in own):
+                continue            # не работает впервые (или просят повторить) — свежие значения
+        working[sticky_key(cur)].append(cur)
+    taken, kept = defaultdict(int), 0
     for node in nodes:
         key = sticky_key(node)
-        for j, cur in enumerate(working):
-            if j in used or sticky_key(cur) != key:
-                continue
-            used.add(j)
-            for field in STICKY_FIELDS:
-                if field in cur["params"]:
-                    node["params"][field] = cur["params"][field]
-                else:
-                    node["params"].pop(field, None)
-            kept += 1
-            break
+        if key not in working:
+            continue
+        # Обычно текущая нода с таким ключом одна. Если тот же сервер пришёл в
+        # подписке несколько раз, все копии получают ОДНИ И ТЕ ЖЕ значения —
+        # иначе копии с разными SNI считались бы разными нодами и список рос бы.
+        # Несколько текущих нод с одним ключом (сервер намеренно записан дважды
+        # с разными SNI) раздаются по порядку.
+        cur = working[key][min(taken[key], len(working[key]) - 1)]
+        taken[key] += 1
+        for field in STICKY_FIELDS:
+            if field in cur["params"]:
+                node["params"][field] = cur["params"][field]
+            else:
+                node["params"].pop(field, None)
+        kept += 1
     return kept
 
 
@@ -457,15 +525,29 @@ def render_links(nodes, deduplicate=True, origins=None):
     """origins — список, в который (если передан) кладутся номера источников
     для каждой выданной ссылки, в том же порядке."""
     if deduplicate:
-        seen = set()
-        unique = []
+        # Из копий одного сервера оставляем одну — на месте первой. Какую именно,
+        # не должно зависеть от порядка выдачи, иначе имя прыгало бы между
+        # скачиваниями. Предпочтение, по убыванию важности:
+        #   1) копия из профиля, где этот сервер один (там имя — имя сервера, а не
+        #      группы вроде «Авто | Лучший сервер» или балансировщика с «приманкой»);
+        #   2) копия с именем, которое встречается реже;
+        #   3) при прочих равных — по самому имени.
+        freq = defaultdict(int)
+        for node in nodes:
+            freq[node["raw_remark"]] += 1
+        best, order = {}, []
         for node in nodes:
             sig = _node_signature(node)
-            if sig in seen:
-                continue
-            seen.add(sig)
-            unique.append(node)
-        nodes = unique
+            if sig not in best:
+                best[sig] = node
+                order.append(sig)
+            else:
+                # при равной редкости выбор тоже не должен зависеть от порядка выдачи
+                old = best[sig]
+                a, b = node["raw_remark"], old["raw_remark"]
+                if (node.get("group_size", 1), freq[a], b) < (old.get("group_size", 1), freq[b], a):
+                    best[sig] = node
+        nodes = [best[sig] for sig in order]
 
     counts = defaultdict(int)
     for node in nodes:
@@ -515,6 +597,16 @@ def main():
                          "нод сохранить прежние SNI и short id")
     ap.add_argument("--health", metavar="FILE",
                     help="Сохранённый ответ Clash API sing-box (/proxies)")
+    ap.add_argument("--frozen", metavar="FILE",
+                    help="Файл с ключами нод, которые не работали и в прошлый раз: "
+                         "их значения повторно не обновляются")
+    ap.add_argument("--dead-out", metavar="FILE",
+                    help="Записать сюда ключи нод, которые сейчас не работают")
+    ap.add_argument("--retry-own", action="store_true",
+                    help="Неработающим нодам первой подписки выдать свежие значения ещё раз")
+    ap.add_argument("--assume-working", action="store_true",
+                    help="Считать все текущие ноды работающими (sing-box только что "
+                         "запущен и ещё не успел их проверить)")
     ap.add_argument("--section", default="main",
                     help="Имя секции podkop (для тегов выходов sing-box)")
     args = ap.parse_args()
@@ -559,7 +651,25 @@ def main():
                 current = [l.strip() for l in f if l.strip()]
         except OSError:
             current = []
-        kept = apply_sticky(nodes, current, load_health(args.health or ""), args.section)
+        frozen = set()
+        if args.frozen:
+            try:
+                with open(args.frozen, "r", encoding="utf-8") as f:
+                    frozen = set(l.rstrip("\n") for l in f if l.strip())
+            except OSError:
+                pass
+        dead = [] if args.dead_out else None
+        kept = apply_sticky(nodes, current, load_health(args.health or ""), args.section,
+                            assume_working=args.assume_working, frozen=frozen, dead_out=dead,
+                            retry_own=args.retry_own)
+        if args.dead_out:
+            try:
+                with open(args.dead_out, "w", encoding="utf-8") as f:
+                    for k in sorted(set(dead)):
+                        f.write(k + "\n")
+            except OSError as e:
+                print("Не удалось записать список неработающих нод: %s" % e, file=sys.stderr)
+        keep_current_order(nodes, current)
         print("Закреплено нод: %d" % kept, file=sys.stderr)
 
     origins = [] if args.origins else None

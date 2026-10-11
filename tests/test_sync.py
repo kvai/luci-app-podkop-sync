@@ -577,6 +577,24 @@ class StickyTests(SyncEnv):
         self.assertIn("Без изменений", msg)
         self.assertIn("сохранены у работающих: 2", msg)
 
+    def test_server_listed_twice_does_not_grow_the_list(self):
+        """Как у Liberty: один сервер приходит и отдельной строкой, и в «авто»-группе,
+        а SNI/short id при каждом скачивании случайные. Список не должен расти и меняться."""
+        def fetch(n):
+            a = N1.replace("sni=www.example.com", "sni=r%d.example.com" % n).replace("sid=aa11", "sid=%04d" % n)
+            return a.split("#")[0] + "#Auto\n" + a.split("#")[0] + "#Poland\n" + N2 + "\n"
+        self.sub("one", fetch(1))
+        self.assertEqual(self.sync(), 0)
+        first = self.links()
+        self.assertEqual(len(first), 2, "две копии одного сервера — одна нода")
+        self.health(**{"main-1-out": 120, "main-2-out": 95})
+        for n in (2, 3, 4):
+            self.sub("one", fetch(n))
+            self.assertEqual(self.sync(), 0)
+            self.assertEqual(self.links(), first, "повторное скачивание с другими SNI ничего не меняет")
+        self.assertEqual(self.reloads(), 1)
+        self.assertIn("Без изменений", self.status()[1])
+
     def test_broken_node_gets_fresh_values(self):
         """На сервере убрали имя — нода встала: ей берём свежие SNI/short id, рабочую не трогаем."""
         self.sync()
@@ -586,6 +604,54 @@ class StickyTests(SyncEnv):
         self.assertEqual(self.links(), [self.N1_ROLLED, N2])
         self.assertEqual(self.reloads(), 2)
         self.assertIn("сохранены у работающих: 1", self.status()[1])
+
+    def test_dead_node_is_refreshed_once_then_left_alone(self):
+        """Лежащая нода не должна менять список при каждой синхронизации."""
+        self.sync()
+        self.health(**{"main-1-out": None, "main-2-out": 95})
+        self.sub("one", self.N1_ROLLED + "\n" + N2 + "\n")
+        self.assertEqual(self.sync(), 0)                       # первая попытка вылечить: свежие значения
+        self.assertEqual(self.links(), [self.N1_ROLLED, N2])
+        self.assertEqual(self.reloads(), 2)
+        self.assertIn("не отвечают: 1", self.status()[1])
+        again = self.N1_ROLLED.replace("sni=other.example.com", "sni=third.example.com").replace("sid=ff99", "sid=1234")
+        for _ in range(3):                                     # нода всё ещё лежит, панель выдаёт всё новые SNI
+            self.sub("one", again + "\n" + N2 + "\n")
+            self.assertEqual(self.sync(), 0)
+        self.assertEqual(self.links(), [self.N1_ROLLED, N2], "список не меняется")
+        self.assertEqual(self.reloads(), 2, "и podkop не перезапускается")
+        self.assertIn("Без изменений", self.status()[1])
+        # по кнопке (force) — ещё одна попытка
+        self.assertEqual(self.run_svc("sync", "force").returncode, 0)
+        self.assertEqual(self.links(), [again, N2])
+        self.assertEqual(self.reloads(), 3)
+        # а лежащую ноду ИЗ ВТОРОЙ подписки кнопка не трогает: чужие серверы не повод перезапускаться
+        self.set_opt("podkop_sub", "config", "url", ["https://sub.test/one", "https://sub.test/two"])
+        ext1 = N2.replace("n2.example.net", "x7.example.net").replace("PBK_TWO", "PBK_X7").split("#")[0] + "#Foreign"
+        self.sub("one", again + "\n" + N2 + "\n")
+        self.sub("two", ext1 + "\n")
+        self.health(**{"main-1-out": 110, "main-2-out": 95})
+        self.assertEqual(self.sync(), 0)
+        self.assertEqual(self.links(), [again, N2, ext1])
+        n = self.reloads()
+        self.health(**{"main-1-out": 110, "main-2-out": 95, "main-3-out": None})
+        ext2 = ext1.replace("sid=bb22", "sid=7777")
+        self.sub("two", ext2 + "\n")
+        self.assertEqual(self.sync(), 0)                       # первая попытка — как у всех
+        self.assertEqual(self.reloads(), n + 1)
+        self.sub("two", ext1.replace("sid=bb22", "sid=8888") + "\n")
+        self.assertEqual(self.run_svc("sync", "force").returncode, 0)
+        self.assertEqual(self.links(), [again, N2, ext2], "по кнопке чужая лежащая нода не меняется")
+        self.assertEqual(self.reloads(), n + 1)
+        self.set_opt("podkop_sub", "config", "url", ["https://sub.test/one"])
+        self.sub("one", self.N1_ROLLED + "\n" + N2 + "\n")
+        self.sync()
+        # нода ожила — отметка снимается, дальше обычное закрепление
+        self.health(**{"main-1-out": 110, "main-2-out": 95})
+        self.sub("one", self.N1_ROLLED + "\n" + N2 + "\n")
+        self.sync()
+        self.assertEqual(self.links(), [again, N2])
+        self.assertNotIn("не отвечают", self.status()[1])
 
     def test_changed_public_key_is_never_stuck(self):
         self.sync()

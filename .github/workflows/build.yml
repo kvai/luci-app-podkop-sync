@@ -26,6 +26,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Тесты идут ДО подстановки номера сборки: они проверяют исходники как есть.
+      - name: Run tests
+        env:
+          PYTHONUTF8: "1"       # тесты и скрипты работают с кириллицей
+          LC_ALL: C.UTF-8
+        run: |
+          python3 tests/test_parser.py
+          python3 -m unittest discover -s tests -p 'test_sync.py'
+
       # Каждая сборка получает растущий номер выпуска (1.1.0-r<номер запуска>):
       # opkg видит её как более новую и обновляет поверх, без opkg remove.
       # Тот же номер попадает в скрипт и показывается в интерфейсе.
@@ -35,14 +44,6 @@ jobs:
           sed -i "s/^RELEASE=.*/RELEASE=\"${GITHUB_RUN_NUMBER}\"/" luci-app-podkop-sync/root/usr/libexec/podkop_sub_service
           grep -n '^PKG_VERSION\|^PKG_RELEASE' luci-app-podkop-sync/Makefile
           grep -n '^VERSION=\|^RELEASE=' luci-app-podkop-sync/root/usr/libexec/podkop_sub_service
-
-      - name: Run tests
-        env:
-          PYTHONUTF8: "1"       # тесты и скрипты работают с кириллицей
-          LC_ALL: C.UTF-8
-        run: |
-          python3 tests/test_parser.py
-          python3 -m unittest discover -s tests -p 'test_sync.py'
 
       - name: Build package (OpenWrt SDK)
         uses: openwrt/gh-action-sdk@main

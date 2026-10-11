@@ -175,6 +175,13 @@ class SyncEnv(unittest.TestCase):
                      '#!/bin/sh\n[ "$1" = enabled ] && { [ -f "$STUB/podkop_disabled" ] && exit 1; exit 0; }\nexit 0\n')
         self._script(os.path.join(self.root, "etc", "init.d", "cron"),
                      '#!/bin/sh\necho "$1" >> "$STUB/cron.log"\n')
+        # Заглушка пробной сборки (настоящая подключает /usr/bin/podkop и проверяется на роутере).
+        # По умолчанию «недоступна» (код 3), чтобы прежние тесты проверяли путь с откатом.
+        os.makedirs(os.path.join(self.root, "usr", "libexec"))
+        self._script(os.path.join(self.root, "usr", "libexec", "podkop_sub_dryrun"),
+                     '#!/bin/sh\necho "$1" >> "$STUB/dryrun.log"\n[ -f "$STUB/preflight_on" ] || exit 3\n'
+                     'if grep -q "BADNODE" "$2"; then echo "[info] building" > "$3.log"; '
+                     'echo "[fatal] Node bad.example.net is not acceptable. Aborted." >> "$3.log"; exit 1; fi\nexit 0\n')
         self.db = os.path.join(self.root, "uci.json")
         self.env = dict(os.environ, PODKOP_SUB_ROOT=self.root, STUB=self.stub, FAKE_UCI_DB=self.db,
                         PODKOP_SUB_PATH=os.pathsep.join(
@@ -864,6 +871,102 @@ class ProtectionTests(SyncEnv):
         with open(os.path.join(lock, "pid"), "w") as f:
             f.write(str(os.getpid()))
         self.assertTrue(json.loads(self.run_svc("status").stdout)["running"])
+
+
+class OriginsTests(SyncEnv):
+    """Плагин сообщает, из какой подписки каждая нода: по этому проба проверяет только «свои»."""
+
+    def origins(self):
+        p = os.path.join(self.root, "etc", "podkop_sub.managed.d", "main.origins")
+        if not os.path.exists(p):
+            return None
+        with open(p, encoding="utf-8") as f:
+            return [tuple(l.rstrip("\n").split("\t", 1)) for l in f if l.strip()]
+
+    def test_origins_follow_subscription_order(self):
+        ext = "vless://ext@ext.example.net:443?type=tcp#external"
+        man = "vless://m@manual.example.net:443?type=tcp#manual"
+        n3 = N2.replace("n2.example.net", "n3.example.net").split("#")[0] + "#Three"
+        d = self.read_db()
+        d["podkop"]["main"]["urltest_proxy_links"] = [ext]
+        d["podkop_sub"]["config"]["manual_nodes"] = man
+        d["podkop_sub"]["config"]["url"] = ["https://sub.test/one", "https://sub.test/two"]
+        self.write_db(d)
+        self.sub("two", n3 + "\n" + N1 + "\n")           # N1 есть в обеих: считается нодой первой подписки
+        self.assertEqual(self.sync(), 0)
+        self.assertEqual(self.links(), [ext, man, N1, N2, n3])
+        self.assertEqual(self.origins(), [("0", man), ("1", N1), ("1", N2), ("2", n3)],
+                         "внешней ноды в файле нет, ручная — 0, дальше по номерам подписок")
+
+    def test_origins_are_kept_in_sync_without_changes_and_on_rollback(self):
+        self.sync()
+        self.assertEqual(self.origins(), [("1", N1), ("1", N2)])
+        os.remove(os.path.join(self.root, "etc", "podkop_sub.managed.d", "main.origins"))
+        self.sync()                                        # список не менялся, файл восстановлен
+        self.assertEqual(self.origins(), [("1", N1), ("1", N2)])
+        self.sub("one", N1 + "\n" + N2 + "\n" + ProtectionTests.BAD + "\n")
+        self.assertEqual(self.sync(), 1)                   # откат
+        self.assertEqual(self.origins(), [("1", N1), ("1", N2)], "после отката источники тоже прежние")
+
+    def test_origins_use_sticky_links(self):
+        self.sync()
+        self.health(**{"main-1-out": 120, "main-2-out": 95})
+        self.sub("one", StickyTests.N1_ROLLED + "\n" + N2 + "\n")
+        self.sync()
+        self.assertEqual(self.origins(), [("1", N1), ("1", N2)], "в файле те же ссылки, что записаны в podkop")
+
+
+class PreflightTests(SyncEnv):
+    """Проверка до применения: podkop не должен падать вовсе, если отказ можно предвидеть."""
+    BAD = ProtectionTests.BAD
+
+    def setUp(self):
+        super().setUp()
+        self.flag("preflight_on")
+
+    def test_bad_set_is_refused_without_touching_podkop(self):
+        self.sync()
+        self.assertEqual(self.reloads(), 1)
+        commits = self.podkop_commits()
+        self.sub("one", N1 + "\n" + N2 + "\n" + self.BAD + "\n")
+        self.assertEqual(self.sync(), 1)
+        self.assertEqual(self.reloads(), 1, "podkop не перезапускался — простоя не было")
+        self.assertEqual(self.podkop_commits(), commits, "конфиг podkop не переписывался")
+        self.assertEqual(self.links(), [N1, N2])
+        st, msg = self.status()
+        self.assertEqual(st, "error")
+        self.assertIn("не сможет запуститься", msg)
+        self.assertIn("список НЕ изменён", msg)
+        self.assertIn("Причина: Node bad.example.net is not acceptable", msg)
+        self.assertFalse(os.path.exists(os.path.join(self.root, "etc", "podkop_sub.managed.d", "main.rejected")),
+                         "простоя не было — запоминать отказ незачем")
+        with open(os.path.join(self.root, "etc", "podkop_sub.managed.d", "main")) as f:
+            self.assertEqual(f.read().split(), [N1, N2], "реестр не тронут")
+
+    def test_good_set_passes_preflight_and_is_applied(self):
+        self.sync()
+        n3 = N2.replace("n2.example.net", "n3.example.net").split("#")[0] + "#Three"
+        self.sub("one", N1 + "\n" + N2 + "\n" + n3 + "\n")
+        self.assertEqual(self.sync(), 0)
+        self.assertEqual(self.links(), [N1, N2, n3])
+        self.assertEqual(self.reloads(), 2)
+
+    def test_preflight_runs_only_when_a_reload_is_coming(self):
+        self.sync()
+        n = len(self.log("dryrun.log"))
+        self.assertEqual(n, 1)
+        self.sync()                                              # без изменений
+        self.sub("one", N1.split("#")[0] + "#Renamed\n" + N2 + "\n")
+        self.sync()                                              # только имя
+        self.assertEqual(len(self.log("dryrun.log")), n, "лишний раз конфиг не собираем")
+
+    def test_unavailable_preflight_falls_back_to_rollback(self):
+        self.sync()
+        self.flag("preflight_on", False)                         # у «новой версии podkop» другое устройство
+        self.sub("one", N1 + "\n" + N2 + "\n" + self.BAD + "\n")
+        self.assertEqual(self.sync(), 1)
+        self.assertEqual(self.links(), [N1, N2])
+        self.assertIn("возвращён прежний список", self.status()[1])
 
 
 class PackageScriptTests(SyncEnv):

@@ -93,6 +93,20 @@ read_current_links() {
 # по файлу на секцию — чтобы при обновлении сносить только свои ноды.
 MANAGED_DIR="$ROOT/etc/podkop_sub.managed.d"
 managed_file() { echo "$MANAGED_DIR/$1"; }
+# Источники нод: строки «N<TAB>ссылка», где N — номер подписки (с 1), 0 — ручная
+# нода из поля плагина. Внешних нод (добавленных прямо в podkop) в файле нет.
+# Файл читают другие инструменты (например, проба доступности): по нему видно,
+# какие ноды «свои» (первая подписка), а какие из дополнительных подписок.
+origins_file() { echo "$MANAGED_DIR/$1.origins"; }
+
+# Положить реестр и источники на место (через временные файлы).
+store_registry() {
+	# $1 = секция, $2 = файл реестра (наши ссылки), $3 = файл источников
+	local mf="$(managed_file "$1")" of="$(origins_file "$1")"
+	mkdir -p "$MANAGED_DIR" || return 1
+	cp "$2" "$mf.tmp" && mv "$mf.tmp" "$mf" || return 1
+	cp "$3" "$of.tmp" && mv "$of.tmp" "$of" || return 1
+}
 
 # Проверка зависимостей: если бинарь есть — пропускаем; если нет — ставим
 # через opkg (актуально для ручной/git-установки; для .ipk зависимости уже
@@ -306,7 +320,7 @@ do_sync() {
 		if [ "$STICKY" = "1" ] && fetch_health "$WORK/proxies.json"; then
 			sflag="--stick $cur --health $WORK/proxies.json --section $SECTION"
 		fi
-		if ! "$PYTHON" "$PARSER" --transports "$transports" $pflag $sflag $parts > "$links" 2>"$WORK/err.log"; then
+		if ! "$PYTHON" "$PARSER" --transports "$transports" --origins "$WORK/origins.sub" $pflag $sflag $parts > "$links" 2>"$WORK/err.log"; then
 			set_status "error" "Ошибка парсера: $(tail -n 1 "$WORK/err.log")" ""
 			log err "parser failed"
 			return 1
@@ -339,7 +353,8 @@ do_sync() {
 						mt=$(printf '%s' "${ml%%#*}" | sed -n 's/.*[?&]type=\([^&]*\).*/\1/p')
 						[ -n "$mt" ] || mt="tcp"
 						case ",$transports," in
-							*",$mt,"*) printf '%s\n' "$ml" >> "$ourlinks"; mcount=$((mcount + 1)) ;;
+							*",$mt,"*) printf '%s\n' "$ml" >> "$ourlinks"; printf '%s\n' "$ml" >> "$WORK/manual_ok.txt"
+							   mcount=$((mcount + 1)) ;;
 							*) mtr=$((mtr + 1))
 							   log warn "manual node skipped: transport '$mt' is not supported by podkop" ;;
 						esac ;;
@@ -356,6 +371,17 @@ do_sync() {
 		printf '%s\n' "$line" >> "$WORK/our_d.txt"
 	done < "$ourlinks"
 	mv "$WORK/our_d.txt" "$ourlinks"
+	# источники для итогового набора: ручные — 0, остальные — номер подписки
+	local origins="$WORK/origins.txt" tab="$(printf '\t')"
+	: > "$origins"
+	while IFS= read -r line; do
+		[ -n "$line" ] || continue
+		if [ -f "$WORK/origins.sub" ] && grep -qF -- "$tab$line" "$WORK/origins.sub" && ! grep -qxF -- "$line" "$WORK/manual_ok.txt" 2>/dev/null; then
+			grep -F -- "$tab$line" "$WORK/origins.sub" | head -n 1 >> "$origins"
+		else
+			printf '0\t%s\n' "$line" >> "$origins"
+		fi
+	done < "$ourlinks"
 
 	# --- что сейчас в podkop и что должно получиться -----------------------
 	local mf="$(managed_file "$SECTION")"
@@ -410,8 +436,8 @@ do_sync() {
 	if cmp -s "$cur" "$new"; then
 		# Реестр всё равно сверяем: нода могла «переехать» из внешних в поле ручных
 		# (список в podkop тот же, а владелец ноды сменился).
-		cmp -s "$ourlinks" "$mf" 2>/dev/null \
-			|| { mkdir -p "$MANAGED_DIR" && cp "$ourlinks" "$mf.tmp" && mv "$mf.tmp" "$mf"; }
+		{ cmp -s "$ourlinks" "$mf" 2>/dev/null && cmp -s "$origins" "$(origins_file "$SECTION")" 2>/dev/null; } \
+			|| store_registry "$SECTION" "$ourlinks" "$origins"
 		uci -q set podkop_sub.config.last_sub="$count"
 		uci -q set podkop_sub.config.last_manual="$((mcount + kept))"
 		# список тот же, что уже стоит и работает, — прежний отказ неактуален
@@ -453,12 +479,34 @@ do_sync() {
 		fi
 	fi
 
+	# --- проверка до применения -------------------------------------------
+	# Собираем конфиг кодом самого podkop в стороне и проверяем его, ничего не
+	# останавливая. Если podkop с этим списком не запустится — узнаём это сейчас,
+	# а не после того, как он остановит sing-box и DNS. Нужна, только когда
+	# перезапуск вообще предстоит.
+	if [ "$(links_signature "$cur")" != "$(links_signature "$new")" ] && podkop_should_run "$is_urltest"; then
+		local drc=0
+		sh "$ROOT/usr/libexec/podkop_sub_dryrun" "$SECTION" "$new" "$WORK/dry.json" >/dev/null 2>&1 || drc=$?
+		if [ "$drc" = 1 ]; then
+			local dwhy
+			dwhy=$(sed -n 's/^\[fatal\] //p' "$WORK/dry.json.log" 2>/dev/null | head -n 1 | cut -c1-160)
+			[ -n "$dwhy" ] || dwhy=$(sed -e 's/\x1b\[[0-9;]*m//g' "$WORK/dry.json.err" 2>/dev/null | head -n 1 | cut -c1-160)
+			set_status "error" "${secwarn}Podkop не сможет запуститься с этим набором нод — список НЕ изменён, VPN работает как прежде (проверено без перезапуска). Причина: ${dwhy:-не определена}. $summary" ""
+			log warn "preflight: podkop would not start with the new nodes — nothing applied"
+			return 1
+		elif [ "$drc" != 0 ]; then
+			# проверка недоступна (другая версия podkop) — остаётся откат после запуска
+			log warn "preflight is not available (rc=$drc) — relying on rollback"
+		fi
+	fi
+
 	# --- запись в podkop -------------------------------------------------
 	# С этого места и до конца перезапуска/отката прерывать работу нельзя:
 	# оборванный на середине sync оставил бы плохой список при лежащем podkop.
 	trap '' INT TERM HUP
-	# прежние реестр и счётчики сохраняем на случай отката
+	# прежние реестр и источники сохраняем на случай отката
 	[ -f "$mf" ] && cp "$mf" "$WORK/registry.old"
+	[ -f "$(origins_file "$SECTION")" ] && cp "$(origins_file "$SECTION")" "$WORK/origins.old"
 	if ! write_links "$SECTION" "$new"; then
 		trap 'exit 1' INT TERM
 		set_status "error" "Не удалось сохранить podkop (конфиг не изменён)" ""
@@ -467,8 +515,7 @@ do_sync() {
 	fi
 
 	# реестр = наши ноды (ручные из поля + подписка); через временный файл
-	mkdir -p "$MANAGED_DIR" && cp "$ourlinks" "$mf.tmp" && mv "$mf.tmp" "$mf" \
-		|| log err "cannot update registry $mf"
+	store_registry "$SECTION" "$ourlinks" "$origins" || log err "cannot update registry $mf"
 
 	# --- перезапуск podkop: только если он действительно нужен -------------
 	local rnote="" applied=1
@@ -503,6 +550,7 @@ do_sync() {
 				log err "rollback failed: cannot write the previous list"
 			else
 				if [ -f "$WORK/registry.old" ]; then cp "$WORK/registry.old" "$mf"; else rm -f "$mf"; fi
+				if [ -f "$WORK/origins.old" ]; then cp "$WORK/origins.old" "$(origins_file "$SECTION")"; else rm -f "$(origins_file "$SECTION")"; fi
 				total=$(count_lines "$cur")
 				if podkop reload >/dev/null 2>&1 && wait_singbox; then
 					# Прежний список поднялся, новый — нет: значит, дело именно в новых

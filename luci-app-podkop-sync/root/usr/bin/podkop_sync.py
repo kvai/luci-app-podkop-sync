@@ -453,7 +453,9 @@ def apply_sticky(nodes, current_links, health, section):
 # Дедуп, нумерация, генерация ссылок
 # --------------------------------------------------------------------------
 
-def render_links(nodes, deduplicate=True):
+def render_links(nodes, deduplicate=True, origins=None):
+    """origins — список, в который (если передан) кладутся номера источников
+    для каждой выданной ссылки, в том же порядке."""
     if deduplicate:
         seen = set()
         unique = []
@@ -485,6 +487,8 @@ def render_links(nodes, deduplicate=True):
             skip("недопустимые символы в ссылке")
             continue
         links.append(link)
+        if origins is not None:
+            origins.append(node.get("source", 0))
     return links
 
 
@@ -503,6 +507,9 @@ def main():
                     help="Транспорты (type=…), которые понимает установленный podkop, "
                          "через запятую. Ноды с другими транспортами отбрасываются: "
                          "podkop на них не стартует и роняет всю сеть")
+    ap.add_argument("--origins", metavar="FILE",
+                    help="Записать сюда «номер подписки<TAB>ссылка» для каждой выданной "
+                         "ноды (номер = порядковый номер файла в аргументах, с 1)")
     ap.add_argument("--stick", metavar="FILE",
                     help="Файл с текущими ссылками секции podkop: у работающих "
                          "нод сохранить прежние SNI и short id")
@@ -517,10 +524,13 @@ def main():
     nodes = []
     try:
         if args.files:
-            for path in args.files:
+            for index, path in enumerate(args.files, 1):
                 # utf-8-sig: BOM в начале файла не должен «съедать» первую ноду
                 with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
-                    nodes.extend(parse_input(f.read()))
+                    parsed = parse_input(f.read())
+                for node in parsed:
+                    node["source"] = index
+                nodes.extend(parsed)
         else:
             nodes.extend(parse_input(sys.stdin.read()))
     except OSError as e:
@@ -552,7 +562,15 @@ def main():
         kept = apply_sticky(nodes, current, load_health(args.health or ""), args.section)
         print("Закреплено нод: %d" % kept, file=sys.stderr)
 
-    links = render_links(nodes, deduplicate=not args.all)
+    origins = [] if args.origins else None
+    links = render_links(nodes, deduplicate=not args.all, origins=origins)
+    if args.origins:
+        try:
+            with open(args.origins, "w", encoding="utf-8") as f:
+                for src, link in zip(origins, links):
+                    f.write("%d\t%s\n" % (src, link))
+        except OSError as e:
+            print("Не удалось записать источники нод: %s" % e, file=sys.stderr)
 
     for link in links:
         sys.stdout.write(link + "\n")

@@ -23,6 +23,11 @@ if ! uci -q get podkop_sub.config >/dev/null 2>&1; then
 	EOF
 fi
 
+# При обновлении opkg не трогает изменённый пользователем конфиг, а вариант из
+# пакета кладёт рядом как podkop_sub-opkg. Умолчания зашиты в самом скрипте,
+# так что этот файл не нужен — убираем, чтобы не копился на flash.
+rm -f /etc/config/podkop_sub-opkg
+
 # включить служебный init-скрипт (procd reload-триггер для cron)
 if [ -x /etc/init.d/podkop_sub ]; then
 	/etc/init.d/podkop_sub enable

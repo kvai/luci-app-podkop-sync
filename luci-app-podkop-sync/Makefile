@@ -23,12 +23,16 @@ endef
 
 # Чистое удаление: снять cron-задачу, отключить сервис, убрать реестр.
 # Выполняется на устройстве при `opkg remove` (не при сборке образа).
-# При ОБНОВЛЕНИИ opkg тоже зовёт prerm (с аргументом upgrade) — тогда ничего
-# не трогаем, иначе пропал бы реестр своих нод и cron-задача.
+# При ОБНОВЛЕНИИ opkg тоже зовёт prerm — тогда ничего не трогаем, иначе пропал
+# бы реестр своих нод и cron-задача. Признак обновления — переменная
+# PKG_UPGRADE=1: сценарий подключается системной default_prerm через «.», и
+# позиционные аргументы в нём не «upgrade», а путь к обёртке (проверка "$$1"
+# в 1.1.0-r1..r14 поэтому не срабатывала).
 define Package/luci-app-podkop-sync/prerm
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT}" ] && exit 0
-[ "$$1" = "upgrade" ] && exit 0
+[ "$${PKG_UPGRADE}" = "1" ] && exit 0
+case " $$* " in *" upgrade "*) exit 0 ;; esac
 # disable only — сервис демона не держит (procd reload-триггер), поэтому
 # 'stop' лишь дёргает 'ubus service delete' и шумит 'Not found' при удалении.
 /etc/init.d/podkop_sub disable 2>/dev/null

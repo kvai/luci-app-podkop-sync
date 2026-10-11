@@ -5,6 +5,12 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+# Новый пуш отменяет незавершённую сборку предыдущего: иначе две сборки
+# наперегонки кладут пакет в один релиз, и остаться может более старый.
+concurrency:
+  group: build-ipk-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: write        # нужно для публикации Release
 

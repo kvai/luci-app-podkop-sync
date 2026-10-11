@@ -649,6 +649,44 @@ class VersionTests(SyncEnv):
         self.assertTrue(json.loads(out)["version"].endswith("-r57"), out)
 
 
+class PackageScriptTests(SyncEnv):
+    def _prerm(self):
+        with open(os.path.join(HERE, "..", "luci-app-podkop-sync", "Makefile"), encoding="utf-8") as f:
+            mk = f.read()
+        body = mk.split("define Package/luci-app-podkop-sync/prerm\n", 1)[1].split("\nendef", 1)[0]
+        return body.replace("$$", "$")
+
+    def test_prerm_does_nothing_on_upgrade(self):
+        """Система подключает prerm через «.» из default_prerm: $1 там — путь к обёртке,
+        а признак обновления — PKG_UPGRADE=1. При обновлении реестр и cron трогать нельзя."""
+        body = self._prerm()
+        self.assertIn("rm -rf /etc/podkop_sub.managed.d", body)
+        guard = body.index("PKG_UPGRADE")
+        self.assertLess(guard, body.index("rm -rf"), "проверка обновления должна стоять до любых действий")
+        self.assertLess(guard, body.index("sed -i"))
+        script = os.path.join(self.root, "prerm-pkg")
+        self._script(script, body)
+        b = os.path.join(self.stub, "bin")
+        for tool in ("rm", "sed"):
+            self._script(os.path.join(b, tool), '#!/bin/sh\necho "%s $*" >> "$STUB/prerm.log"\n' % tool)
+        # как в /lib/functions.sh: default_prerm <путь к обёртке> upgrade <версия>
+        wrapper = 'default_prerm() { ( . "%s" ); }\ndefault_prerm /usr/lib/opkg/info/x.prerm upgrade 1.1.0-r1\n' % script
+        env = dict(self.env, PATH=b, PKG_UPGRADE="1")
+        env.pop("IPKG_INSTROOT", None)
+        p = subprocess.run(["/bin/sh", "-c", wrapper], env=env, capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(self.log("prerm.log"), [], "при обновлении prerm не должен ничего удалять")
+        # и по одному только аргументу «upgrade» (на случай прямого вызова) тоже
+        env2 = dict(self.env, PATH=b)
+        env2.pop("PKG_UPGRADE", None)
+        p = subprocess.run(["/bin/sh", script, "upgrade", "1.1.0-r1"], env=env2, capture_output=True, text=True)
+        self.assertEqual(self.log("prerm.log"), [])
+
+    def test_postinst_removes_opkg_leftover_config(self):
+        with open(os.path.join(PKG, "etc", "uci-defaults", "luci-app-podkop-sync"), encoding="utf-8") as f:
+            self.assertIn("rm -f /etc/config/podkop_sub-opkg", f.read())
+
+
 class CronTests(SyncEnv):
     CRON = "etc/crontabs/root"
     FOREIGN = ["13 9 * * * /usr/bin/podkop list_update",

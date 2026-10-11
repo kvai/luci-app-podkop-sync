@@ -128,12 +128,53 @@ fetch_health() {
 	fi
 }
 
+# Транспорты, с которыми podkop умеет работать. Нода с неизвестным транспортом
+# опасна: podkop сначала останавливается (снимает nft и sing-box, а с ним и DNS
+# всей сети) и только потом обнаруживает, что конфиг собрать не может.
+# tcp/raw/ws/grpc podkop разбирает сам; xhttp — только если установленный
+# sing-box умеет «tools decode-link» (podkop-engine), это видно в его features.
+supported_transports() {
+	local t="tcp,raw,ws,grpc"
+	podkop get_sing_box_features 2>/dev/null | grep -q 'tools\.decode-link' && t="$t,xhttp,splithttp"
+	echo "$t"
+}
+
+# Отпечаток окружения podkop: по нему решаем, имеет ли смысл повторять набор
+# нод, который podkop уже отверг (после обновления podkop/sing-box — имеет).
+podkop_fingerprint() {
+	echo "$(podkop show_version 2>/dev/null | head -n 1)|$(podkop get_sing_box_features 2>/dev/null | tr -d ' \n')"
+}
+
+# Набор нод без того, что меняется от скачивания к скачиванию (имя, SNI,
+# short id): для сравнения «это тот же набор, что уже был отвергнут».
+stable_signature() {
+	sed -e 's/#.*$//' -e 's/[?&]sni=[^&]*//' -e 's/[?&]sid=[^&]*//' "$1" | sort -u
+}
+
+# Записать список ссылок из файла в секцию podkop и закоммитить.
+write_links() {
+	# $1 = секция, $2 = файл со ссылками
+	local line werr=0
+	uci -q delete "podkop.$1.urltest_proxy_links"
+	while IFS= read -r line; do
+		[ -n "$line" ] || continue
+		uci add_list "podkop.$1.urltest_proxy_links=$line" || werr=1
+	done < "$2"
+	if [ "$werr" = 1 ] || ! uci commit podkop; then
+		uci -q revert podkop
+		return 1
+	fi
+	return 0
+}
+
 # --- блокировка от параллельных запусков (cron + кнопка, двойной клик) ------
 # mkdir атомарен; если владелец блокировки уже умер — считаем её брошенной.
 acquire_lock() {
 	if ! mkdir "$LOCK" 2>/dev/null; then
 		local pid
 		pid=$(cat "$LOCK/pid" 2>/dev/null)
+		# владелец мог только что создать каталог и ещё не записать pid
+		[ -n "$pid" ] || { sleep 1; pid=$(cat "$LOCK/pid" 2>/dev/null); }
 		if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
 			return 1
 		fi
@@ -154,7 +195,11 @@ links_signature() { sed 's/#.*$//' "$1" | sort -u; }
 # ---------------------------------------------------------------------------
 # sync
 # ---------------------------------------------------------------------------
+FORCE=0
 cmd_sync() {
+	# «force» передаёт кнопка в LuCI: человек сам просит попробовать ещё раз,
+	# поэтому память об отвергнутом наборе игнорируется. Cron зовёт без него.
+	[ "$1" = "force" ] && FORCE=1
 	if ! acquire_lock; then
 		log warn "sync is already running — skipped"
 		return 2
@@ -185,7 +230,8 @@ do_sync() {
 	mkdir -p "$WORK" || { log err "cannot create $WORK"; return 1; }
 	local links="$WORK/links.txt"
 	: > "$links"
-	local count=0 nosub=0 persub="" stuck=0
+	local count=0 nosub=0 persub="" stuck=0 trnote="" mtr=0
+	local transports="$(supported_transports)"
 	# что сейчас записано в секции podkop (нужно и для закрепления, и для сравнения)
 	local cur="$WORK/cur.txt"
 	read_current_links "$SECTION" "$cur"
@@ -223,10 +269,16 @@ do_sync() {
 			if curl -fsSL --max-redirs 3 --proto '=http,https' --proto-redir '=http,https' \
 				--max-filesize 2097152 -A "$USER_AGENT" \
 				--connect-timeout 10 --max-time 30 -o "$part" -- "$url"; then
-				c=$("$PYTHON" "$PARSER" "$part" 2>/dev/null | grep -c .)
+				c=$("$PYTHON" "$PARSER" --transports "$transports" "$part" 2>"$WORK/sub_$i.err" | grep -c .)
 				c="${c:-0}"
 				if [ "$c" -gt 0 ]; then
 					parts="$parts $part"; ok=$((ok + 1)); persub="$persub #$i=$c"
+				elif grep -q '^Пропущено из-за транспорта' "$WORK/sub_$i.err" 2>/dev/null; then
+					# ноды есть, но все с транспортом, которого podkop не умеет: это не
+					# сбой подписки, остальные подписки из-за неё блокировать нельзя
+					parts="$parts $part"; ok=$((ok + 1))
+					persub="$persub #$i=0(транспорт не поддерживается)"
+					log warn "subscription #$i: all nodes use unsupported transports"
 				else
 					persub="$persub #$i=0(пусто)"; failed=$((failed + 1))
 					log warn "subscription #$i returned 0 usable nodes"
@@ -254,7 +306,7 @@ do_sync() {
 		if [ "$STICKY" = "1" ] && fetch_health "$WORK/proxies.json"; then
 			sflag="--stick $cur --health $WORK/proxies.json --section $SECTION"
 		fi
-		if ! "$PYTHON" "$PARSER" $pflag $sflag $parts > "$links" 2>"$WORK/err.log"; then
+		if ! "$PYTHON" "$PARSER" --transports "$transports" $pflag $sflag $parts > "$links" 2>"$WORK/err.log"; then
 			set_status "error" "Ошибка парсера: $(tail -n 1 "$WORK/err.log")" ""
 			log err "parser failed"
 			return 1
@@ -262,12 +314,13 @@ do_sync() {
 		count=$(count_lines "$links")
 		stuck=$(sed -n 's/^Закреплено нод: //p' "$WORK/err.log")
 		case "$stuck" in ''|*[!0-9]*) stuck=0 ;; esac
+		trnote=$(sed -n 's/^Пропущено из-за транспорта: //p' "$WORK/err.log" | head -n 1)
 	fi
 
 	# --- «наши» ноды: ручные из поля manual_nodes + ноды подписки ------------
 	local ourlinks="$WORK/our.txt"
 	: > "$ourlinks"
-	local mcount=0 mskip=0
+	local mcount=0 mskip=0 mt
 	# ручные ноды: по одной vless:// в строке. Обрезаем пробелы по краям; строки
 	# с пробелом ВНУТРИ ссылки пропускаем (незакодированный фрагмент сломал бы
 	# разбор ссылки в podkop).
@@ -281,7 +334,15 @@ do_sync() {
 						mskip=$((mskip + 1))
 						log warn "manual node with internal space skipped (encode the #name)" ;;
 					*)
-						printf '%s\n' "$ml" >> "$ourlinks"; mcount=$((mcount + 1)) ;;
+						# ручные ноды парсер не проходят — транспорт проверяем здесь,
+						# по тому же белому списку (нет type= значит tcp)
+						mt=$(printf '%s' "${ml%%#*}" | sed -n 's/.*[?&]type=\([^&]*\).*/\1/p')
+						[ -n "$mt" ] || mt="tcp"
+						case ",$transports," in
+							*",$mt,"*) printf '%s\n' "$ml" >> "$ourlinks"; mcount=$((mcount + 1)) ;;
+							*) mtr=$((mtr + 1))
+							   log warn "manual node skipped: transport '$mt' is not supported by podkop" ;;
+						esac ;;
 				esac ;;
 		esac
 	done < "$WORK/manual_raw.txt"
@@ -325,12 +386,14 @@ do_sync() {
 	# сводка ручных: сколько пропущено из-за пробелов
 	local mnote=""
 	[ "$mskip" -gt 0 ] && mnote=" (пропущено ручных с пробелом: $mskip)"
+	[ "$mtr" -gt 0 ] && mnote="$mnote (пропущено ручных с неподдерживаемым транспортом: $mtr)"
 	local summary
 	if [ "$nosub" = 1 ]; then
 		summary="Без подписки. Вручную: $mcount, внешних: $kept, всего: $total$mnote"
 	else
 		summary="Подписки:$persub · вручную: $mcount, внешних: $kept, всего: $total$mnote"
 		[ "$stuck" -gt 0 ] && summary="$summary · SNI/short id сохранены у работающих: $stuck"
+		[ -n "$trnote" ] && summary="$summary · не поддерживаются podkop и пропущены: $trnote"
 	fi
 	# статус warn, если секция не в режиме URLTest
 	local slvl="ok"
@@ -351,21 +414,53 @@ do_sync() {
 			|| { mkdir -p "$MANAGED_DIR" && cp "$ourlinks" "$mf.tmp" && mv "$mf.tmp" "$mf"; }
 		uci -q set podkop_sub.config.last_sub="$count"
 		uci -q set podkop_sub.config.last_manual="$((mcount + kept))"
-		set_status "$slvl" "${secwarn}Без изменений. $summary" "$total"
+		# список тот же, что уже стоит и работает, — прежний отказ неактуален
+		rm -f "$MANAGED_DIR/$SECTION.rejected"
+		local upnote=""
+		if podkop_should_run "$is_urltest" && ! singbox_running; then
+			# список не менялся, но sing-box не работает — поднимаем
+			log warn "sing-box is not running — reloading podkop"
+			if podkop reload >/dev/null 2>&1 && wait_singbox; then
+				upnote=" Podkop не работал — перезапущен."
+			else
+				set_status "error" "${secwarn}Список нод не менялся, но podkop не запускается — проверьте: logread -e podkop. $summary" "$total"
+				return 1
+			fi
+		fi
+		set_status "$slvl" "${secwarn}Без изменений. $summary.$upnote" "$total"
 		log info "sync ok: no changes ($total nodes) in '$SECTION'"
 		return 0
 	fi
 
-	# --- запись в podkop -------------------------------------------------
-	local werr=0
-	uci -q delete "podkop.$SECTION.urltest_proxy_links"
-	while IFS= read -r line; do
-		[ -n "$line" ] || continue
-		uci add_list "podkop.$SECTION.urltest_proxy_links=$line" || werr=1
-	done < "$new"
+	# Этот же набор нод podkop уже отверг (и сам podkop с тех пор не менялся) —
+	# не роняем сеть повторно, например каждую ночь по cron. Отметка живёт
+	# неделю; кнопка в LuCI (force) её игнорирует.
+	local rejected="$MANAGED_DIR/$SECTION.rejected"
+	[ -f "$rejected" ] && [ -n "$(find "$rejected" -mtime +7 2>/dev/null)" ] && rm -f "$rejected"
+	if [ -f "$rejected" ] && [ "$FORCE" != 1 ]; then
+		{ podkop_fingerprint; stable_signature "$new"; } > "$WORK/attempt.sig"
+		if cmp -s "$WORK/attempt.sig" "$rejected"; then
+			local rjnote="работает прежний список"
+			if podkop_should_run "$is_urltest" && ! singbox_running; then
+				log warn "sing-box is not running — reloading podkop with the current list"
+				podkop reload >/dev/null 2>&1 && wait_singbox \
+					&& rjnote="podkop не работал и перезапущен на прежнем списке" \
+					|| rjnote="podkop НЕ работает и на прежнем списке — проверьте: logread -e podkop"
+			fi
+			set_status "error" "${secwarn}Этот набор нод podkop уже отверг — повторно не применяю, $rjnote. Попробовать ещё раз: кнопка «Обновить сейчас». $summary" ""
+			log warn "node set was already rejected by podkop — not applying again"
+			return 1
+		fi
+	fi
 
-	if [ "$werr" = 1 ] || ! uci commit podkop; then
-		uci -q revert podkop
+	# --- запись в podkop -------------------------------------------------
+	# С этого места и до конца перезапуска/отката прерывать работу нельзя:
+	# оборванный на середине sync оставил бы плохой список при лежащем podkop.
+	trap '' INT TERM HUP
+	# прежние реестр и счётчики сохраняем на случай отката
+	[ -f "$mf" ] && cp "$mf" "$WORK/registry.old"
+	if ! write_links "$SECTION" "$new"; then
+		trap 'exit 1' INT TERM
 		set_status "error" "Не удалось сохранить podkop (конфиг не изменён)" ""
 		log err "writing podkop config failed"
 		return 1
@@ -375,11 +470,8 @@ do_sync() {
 	mkdir -p "$MANAGED_DIR" && cp "$ourlinks" "$mf.tmp" && mv "$mf.tmp" "$mf" \
 		|| log err "cannot update registry $mf"
 
-	uci -q set podkop_sub.config.last_sub="$count"
-	uci -q set podkop_sub.config.last_manual="$((mcount + kept))"
-
 	# --- перезапуск podkop: только если он действительно нужен -------------
-	local rnote=""
+	local rnote="" applied=1
 	if [ "$(links_signature "$cur")" = "$(links_signature "$new")" ]; then
 		rnote=" Изменились только имена или порядок — podkop не перезапускался."
 		log info "only names/order changed — no podkop reload"
@@ -390,27 +482,77 @@ do_sync() {
 		log info "podkop is disabled — no reload"
 	else
 		# podkop reload = полная остановка и запуск (nft, sing-box, DNS).
+		# Метка в логе: причину отказа ищем только среди строк после неё.
+		local mark="reload-$$-$(date +%s)"
+		logger -t podkop_sub "$mark"
 		if podkop reload >/dev/null 2>&1 && wait_singbox; then
 			rnote=" Podkop перезапущен."
+			rm -f "$rejected"
 		else
-			slvl="error"
-			rnote=" Ноды записаны, но podkop не запустился — проверьте: logread -e podkop"
-			log err "podkop did not come up after reload"
+			# Podkop не поднялся на новых нодах, а с ним лежит DNS всей сети.
+			# Возвращаем прежний список.
+			slvl="error"; applied=0
+			local why
+			why=$(logread 2>/dev/null | sed -n "/$mark/,\$p" | sed -n 's/.*podkop: \[fatal\] //p' | head -n 1 | cut -c1-160)
+			[ -n "$why" ] && why=" Причина: $why"
+			log err "podkop did not come up with the new nodes — rolling back"
+			if [ "$(count_lines "$cur")" -eq 0 ]; then
+				rnote=" Ноды записаны, но podkop не запустился, а вернуть нечего (прежний список был пуст) — проверьте: logread -e podkop.$why"
+			elif ! write_links "$SECTION" "$cur" && ! write_links "$SECTION" "$cur"; then
+				rnote=" Podkop не принял новые ноды, а вернуть прежний список не удалось (ошибка записи) — проверьте: logread -e podkop.$why"
+				log err "rollback failed: cannot write the previous list"
+			else
+				if [ -f "$WORK/registry.old" ]; then cp "$WORK/registry.old" "$mf"; else rm -f "$mf"; fi
+				total=$(count_lines "$cur")
+				if podkop reload >/dev/null 2>&1 && wait_singbox; then
+					# Прежний список поднялся, новый — нет: значит, дело именно в новых
+					# нодах. Только в этом случае запоминаем набор как отвергнутый.
+					mkdir -p "$MANAGED_DIR" && { podkop_fingerprint; stable_signature "$new"; } > "$rejected"
+					rnote=" Podkop НЕ принял новые ноды — возвращён прежний список ($total), VPN работает на нём.$why"
+					log warn "rolled back to the previous $total nodes"
+				else
+					# Не поднялся и на прежнем: причина не в нодах (сеть, сам podkop).
+					# Отказ НЕ запоминаем, чтобы следующий запуск попробовал снова.
+					rnote=" Podkop не запустился ни на новых нодах, ни на прежних (возвращён прежний список) — проверьте: logread -e podkop.$why"
+					log err "rollback did not bring podkop up"
+				fi
+			fi
 		fi
 	fi
+	trap 'exit 1' INT TERM
 
+	# счётчики для плиток — только если новый список действительно применён
+	if [ "$applied" = 1 ]; then
+		uci -q set podkop_sub.config.last_sub="$count"
+		uci -q set podkop_sub.config.last_manual="$((mcount + kept))"
+	fi
 	set_status "$slvl" "${secwarn}$summary.$rnote" "$total"
-	log info "sync done: sub=$count manual=$mcount external=$kept total=$total in '$SECTION'"
+	log info "sync done: sub=$count manual=$mcount external=$kept total=$total in '$SECTION' status=$slvl"
 	[ "$slvl" = "error" ] && return 1
 	return 0
 }
 
-# sing-box должен подняться после reload; ждём до 20 секунд
+singbox_running() { pidof sing-box >/dev/null 2>&1; }
+
+# Должен ли podkop сейчас работать: секция в режиме urltest и служба включена.
+podkop_should_run() {
+	[ "$1" = 1 ] && "$ROOT/etc/init.d/podkop" enabled >/dev/null 2>&1
+}
+
+# sing-box должен подняться после reload и НЕ упасть сразу: считаем его живым,
+# только когда три проверки подряд (с интервалом в секунду) видят один и тот же
+# процесс. Иначе procd-перезапуск падающего sing-box выглядел бы как успех.
 wait_singbox() {
-	local i=0
-	while [ $i -lt 20 ]; do
-		# pidof, а не pgrep -x: в busybox «pgrep -x sing-box» процесс не находит
-		pidof sing-box >/dev/null 2>&1 && return 0
+	local i=0 p last="" same=0
+	while [ $i -lt 25 ]; do
+		p=$(pidof sing-box 2>/dev/null)
+		if [ -n "$p" ] && [ "$p" = "$last" ]; then
+			same=$((same + 1))
+			[ "$same" -ge 2 ] && return 0
+		else
+			same=0
+		fi
+		last="$p"
 		sleep 1
 		i=$((i + 1))
 	done
@@ -501,8 +643,11 @@ cmd_status() {
 	case "$sub" in ''|*[!0-9]*) sub=0 ;; esac
 	case "$man" in ''|*[!0-9]*) man=0 ;; esac
 
-	printf '{"version":"%s","status":"%s","message":"%s","last_update":%s,"count":%s,"sub":%s,"manual":%s,"section":"%s","nodes":[%s]}\n' \
-		"$VERSION-$([ "$RELEASE" = dev ] && echo dev || echo "r$RELEASE")" \
+	local running="false" lpid
+	lpid=$(cat "$LOCK/pid" 2>/dev/null)
+	[ -n "$lpid" ] && kill -0 "$lpid" 2>/dev/null && running="true"
+	printf '{"running":%s,"version":"%s","status":"%s","message":"%s","last_update":%s,"count":%s,"sub":%s,"manual":%s,"section":"%s","nodes":[%s]}\n' \
+		"$running" "$VERSION-$([ "$RELEASE" = dev ] && echo dev || echo "r$RELEASE")" \
 		"$(printf '%s' "$st" | json_escape)" \
 		"$(printf '%s' "$ms" | json_escape)" \
 		"${up:-0}" "$cnt" "${sub:-0}" "${man:-0}" "$(printf '%s' "$SECTION" | json_escape)" \
@@ -527,7 +672,7 @@ cmd_sections() {
 
 # ---------------------------------------------------------------------------
 case "$1" in
-	sync)        cmd_sync ;;
+	sync)        cmd_sync "$2" ;;
 	update_cron) cmd_update_cron ;;
 	status)      cmd_status ;;
 	sections)    cmd_sections ;;

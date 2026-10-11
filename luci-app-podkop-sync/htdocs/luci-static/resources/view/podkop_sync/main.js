@@ -327,7 +327,9 @@ return view.extend({
 				var old = document.getElementById('podkop-nodes-panel');
 				if (old && old.parentNode) old.parentNode.replaceChild(newNodes, old);
 
-				if (res.status === 'ok')
+				if (res.running)
+					ui.addNotification(null, E('p', {}, [ _('Синхронизация ещё выполняется: podkop перезапускается. Обновите страницу через минуту, чтобы увидеть результат.') ]), 'info');
+				else if (res.status === 'ok')
 					ui.addNotification(null, E('p', {}, [ String(res.message || _('Обновлено: %s нод.').format(res.count || 0)) ]), 'info');
 				else
 					ui.addNotification(null, E('p', {}, [ String(res.message || _('Обновление не удалось.')) ]), 'danger');

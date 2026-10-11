@@ -499,6 +499,10 @@ def main():
                          "источник со своим форматом; без аргументов — stdin)")
     ap.add_argument("--all", action="store_true",
                     help="Не удалять дубликаты (сохранить все ноды)")
+    ap.add_argument("--transports", metavar="LIST",
+                    help="Транспорты (type=…), которые понимает установленный podkop, "
+                         "через запятую. Ноды с другими транспортами отбрасываются: "
+                         "podkop на них не стартует и роняет всю сеть")
     ap.add_argument("--stick", metavar="FILE",
                     help="Файл с текущими ссылками секции podkop: у работающих "
                          "нод сохранить прежние SNI и short id")
@@ -522,6 +526,22 @@ def main():
     except OSError as e:
         print("Ошибка чтения входных данных: %s" % e, file=sys.stderr)
         return 1
+
+    if args.transports:
+        allowed = set(t.strip() for t in args.transports.split(",") if t.strip())
+        kept_nodes, dropped = [], defaultdict(int)
+        for node in nodes:
+            transport = node["params"].get("type", "tcp")
+            if transport in allowed:
+                kept_nodes.append(node)
+            else:
+                dropped[transport] += 1
+        nodes = kept_nodes
+        if dropped:
+            # одна строка для бэкенда: он покажет её в статусе
+            print("Пропущено из-за транспорта: %d (%s)" % (
+                sum(dropped.values()),
+                ", ".join("%s: %d" % (k, v) for k, v in sorted(dropped.items()))), file=sys.stderr)
 
     if args.stick:
         try:

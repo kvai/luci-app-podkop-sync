@@ -143,9 +143,32 @@ class SyncEnv(unittest.TestCase):
         # конфиг sing-box с адресом Clash API; сам ответ API (stub/subs/proxies) кладут только тесты закрепления
         with open(os.path.join(self.root, "etc", "sing-box", "config.json"), "w") as f:
             json.dump({"experimental": {"clash_api": {"external_controller": "127.0.0.1:9090"}}}, f)
+        # заглушка podkop: отдаёт features/версию; reload падает, если в списке есть «плохая» нода
+        # (как настоящий: сначала останавливается, потом обнаруживает, что конфиг не собрать)
         self._script(os.path.join(b, "podkop"),
-                     '#!/bin/sh\necho "$*" >> "$STUB/podkop.log"\n[ -f "$STUB/podkop_fail" ] && exit 1\nexit 0\n')
-        self._script(os.path.join(b, "pidof"), '#!/bin/sh\n[ -f "$STUB/no_singbox" ] && exit 1\nexit 0\n')
+                     '#!/bin/sh\n'
+                     'case "$1" in\n'
+                     '  get_sing_box_features) cat "$STUB/features" 2>/dev/null || echo "[]"; exit 0 ;;\n'
+                     '  show_version) cat "$STUB/version" 2>/dev/null || echo "v0.7.23"; exit 0 ;;\n'
+                     'esac\n'
+                     'echo "$*" >> "$STUB/podkop.log"\n'
+                     '[ -f "$STUB/podkop_fail" ] && exit 1\n'
+                     'if uci -q get podkop.main.urltest_proxy_links | grep -q "BADNODE\\|[?&]type=xhttp"; then\n'
+                     '  [ -f "$STUB/xhttp_ok" ] && ! uci -q get podkop.main.urltest_proxy_links | grep -q BADNODE && exit 0\n'
+                     '  touch "$STUB/singbox_dead"\n'
+                     '  echo "podkop: [fatal] The xhttp transport is not supported by the installed sing-box. Aborted." >> "$STUB/syslog"\n'
+                     '  echo "podkop: [fatal] Sing-box configuration /tmp/tmp.X is invalid. Aborted." >> "$STUB/syslog"\n'
+                     '  [ -f "$STUB/term_parent" ] && kill -TERM $PPID\n'
+                     '  exit 1\n'
+                     'fi\n'
+                     'rm -f "$STUB/singbox_dead"\nexit 0\n')
+        # «системный лог»: туда пишут заглушки logger и podkop; в начале — старая, не относящаяся к делу fatal-строка
+        with open(os.path.join(self.stub, "syslog"), "w") as f:
+            f.write("podkop: [fatal] OLD unrelated failure from yesterday\n")
+        self._script(os.path.join(b, "logread"), '#!/bin/sh\ncat "$STUB/syslog"\n')
+        self._script(os.path.join(b, "pidof"),
+                     '#!/bin/sh\n[ -f "$STUB/no_singbox" ] && exit 1\n[ -f "$STUB/singbox_dead" ] && exit 1\n'
+                     '[ -f "$STUB/singbox_flapping" ] && { date +%N%s; exit 0; }\necho 4242\nexit 0\n')
         self._script(os.path.join(b, "sleep"), "#!/bin/sh\nexit 0\n")
         self._script(os.path.join(b, "logger"), '#!/bin/sh\necho "$*" >> "$STUB/syslog"\n')
         self._script(os.path.join(self.root, "etc", "init.d", "podkop"),
@@ -647,6 +670,200 @@ class VersionTests(SyncEnv):
         self._script(stamped, src.replace('\nRELEASE="dev"\n', '\nRELEASE="57"\n'))
         out = subprocess.run(["sh", stamped, "status"], env=self.env, capture_output=True, text=True).stdout
         self.assertTrue(json.loads(out)["version"].endswith("-r57"), out)
+
+
+class ProtectionTests(SyncEnv):
+    """Нода, которую podkop не понимает, не должна оставлять дом без интернета."""
+    # параметры в алфавитном порядке — так их выдаёт парсер
+    XH = ("vless://11111111-2222-4333-8444-555555555555@x1.example.net:8443?encryption=none&fp=firefox"
+          "&mode=stream-one&path=%2Fapi&pbk=PBK_X&security=reality&sid=dd44&sni=x.example.com&type=xhttp#XH")
+    WS = ("vless://11111111-2222-4333-8444-555555555555@w1.example.net:443?encryption=none&fp=edge"
+          "&host=w1.example.net&path=%2Ffeed&security=tls&sni=w1.example.net&type=ws#WS")
+    KCP = "vless://11111111-2222-4333-8444-555555555555@k1.example.net:443?type=kcp&security=none#KCP"
+    BAD = "vless://11111111-2222-4333-8444-555555555555@bad.example.net:443?type=tcp&security=none&x=BADNODE#Bad"
+    BAD_R = ("vless://11111111-2222-4333-8444-555555555555@bad2.example.net:443?encryption=none&fp=firefox"
+             "&pbk=PBK_B&security=reality&sid=77&sni=b.example.com&type=tcp&x=BADNODE#Bad")
+
+    def sing_box_alive(self):
+        return not os.path.exists(os.path.join(self.stub, "singbox_dead"))
+
+    def test_xhttp_nodes_are_dropped_when_not_supported(self):
+        """Сценарий с подпиской Liberty: xhttp-ноды отсекаются до записи, podkop не падает."""
+        self.sub("one", N1 + "\n" + self.XH + "\n" + self.WS + "\n" + self.KCP + "\n" + N2 + "\n")
+        self.assertEqual(self.sync(), 0)
+        self.assertEqual(self.links(), [N1, self.WS, N2])
+        self.assertTrue(self.sing_box_alive())
+        st, msg = self.status()
+        self.assertEqual(st, "ok")
+        self.assertIn("#1=3", msg)
+        self.assertIn("не поддерживаются podkop и пропущены: 2 (kcp: 1, xhttp: 1)", msg)
+
+    def test_xhttp_nodes_are_kept_when_sing_box_supports_them(self):
+        with open(os.path.join(self.stub, "features"), "w") as f:
+            f.write('["tools.decode-link","with_quic"]')
+        self.flag("xhttp_ok")
+        self.sub("one", N1 + "\n" + self.XH + "\n")
+        self.assertEqual(self.sync(), 0)
+        self.assertEqual(self.links(), [N1, self.XH])
+        self.assertNotIn("пропущены", self.status()[1])
+
+    def test_manual_xhttp_node_is_skipped(self):
+        ok_manual = "vless://m@manual.example.net:443?security=none#no-type-means-tcp"
+        self.set_opt("podkop_sub", "config", "manual_nodes",
+                     self.XH + "\n" + self.KCP + "\n" + self.XH.replace("type=xhttp", "type=XHTTP").replace("x1.", "x2.")
+                     + "\n" + ok_manual + "\nvless://m@h.example.net:443?type=tcp#name-with-type=xhttp-inside")
+        self.assertEqual(self.sync(), 0)
+        self.assertEqual(self.links(), [ok_manual, "vless://m@h.example.net:443?type=tcp#name-with-type=xhttp-inside", N1, N2])
+        self.assertIn("пропущено ручных с неподдерживаемым транспортом: 3", self.status()[1])
+
+    def test_rollback_when_podkop_rejects_new_nodes(self):
+        self.sync()
+        self.assertEqual(self.reloads(), 1)
+        self.sub("one", N1 + "\n" + N2 + "\n" + self.BAD + "\n")     # транспорт допустимый, но podkop её не переварит
+        self.assertEqual(self.sync(), 1)
+        self.assertEqual(self.links(), [N1, N2], "возвращён прежний список")
+        self.assertTrue(self.sing_box_alive(), "после отката podkop снова работает")
+        self.assertEqual(self.reloads(), 3, "попытка + откат")
+        st, msg = self.status()
+        self.assertEqual(st, "error")
+        self.assertIn("возвращён прежний список (2)", msg)
+        self.assertIn("Причина: The xhttp transport is not supported", msg)     # первая fatal-строка ЭТОЙ попытки
+        self.assertNotIn("is invalid", msg)
+        self.assertNotIn("OLD unrelated", msg)
+        c = self.read_db()["podkop_sub"]["config"]
+        self.assertEqual((c["last_sub"], c["last_count"]), ("2", "2"), "плитки показывают то, что реально применено")
+        with open(os.path.join(self.root, "etc", "podkop_sub.managed.d", "main")) as f:
+            self.assertEqual(f.read().split(), [N1, N2], "реестр тоже возвращён")
+
+    def test_rejected_set_is_not_applied_again(self):
+        """Ночной cron не должен ронять сеть каждый раз одной и той же плохой подпиской."""
+        self.sync()
+        self.sub("one", N1 + "\n" + N2 + "\n" + self.BAD + "\n")
+        self.sync()
+        n = self.reloads()
+        # панель при следующем скачивании выдала другие SNI/short id — набор по сути тот же
+        rolled = (N1.replace("sni=www.example.com", "sni=zzz.example.com").replace("sid=aa11", "sid=9999") + "\n" + N2 + "\n"
+                  + self.BAD_R.replace("sni=b.example.com", "sni=other.example.com").replace("sid=77", "sid=88").replace("#Bad", "#Renamed") + "\n")
+        self.sub("one", N1 + "\n" + N2 + "\n" + self.BAD_R + "\n")
+        self.assertEqual(self.sync(), 1)                 # другой плохой набор — честная попытка и откат
+        n = self.reloads()
+        self.sub("one", rolled)
+        self.assertEqual(self.sync(), 1)
+        self.assertEqual(self.sync(), 1)
+        self.assertEqual(self.reloads(), n, "podkop больше не дёргаем: набор тот же с точностью до SNI/short id/имён")
+        self.assertEqual(self.links(), [N1, N2])
+        self.assertIn("уже отверг", self.status()[1])
+        # кнопка в LuCI (force) — человек просит попробовать ещё раз
+        self.assertEqual(self.run_svc("sync", "force").returncode, 1)
+        self.assertEqual(self.reloads(), n + 2, "по кнопке попытка делается")
+        n = self.reloads()
+        # podkop обновили — пробуем снова (и снова откатываемся, раз нода всё ещё плохая)
+        with open(os.path.join(self.stub, "version"), "w") as f:
+            f.write("v0.8.0")
+        self.assertEqual(self.sync(), 1)
+        self.assertEqual(self.reloads(), n + 2)
+        # плохую ноду убрали из подписки — всё применяется, отметка об отказе снята
+        self.sub("one", N1 + "\n")
+        self.assertEqual(self.sync(), 0)
+        self.assertEqual(self.links(), [N1])
+        self.assertFalse(os.path.exists(os.path.join(self.root, "etc", "podkop_sub.managed.d", "main.rejected")))
+
+    def test_rollback_keeps_external_and_manual_nodes(self):
+        ext = "vless://ext@ext.example.net:443?type=tcp#external"
+        d = self.read_db()
+        d["podkop"]["main"]["urltest_proxy_links"] = [ext]
+        self.write_db(d)
+        self.sync()
+        self.assertEqual(self.links(), [ext, N1, N2])
+        self.set_opt("podkop_sub", "config", "manual_nodes", self.BAD)
+        self.assertEqual(self.sync(), 1)
+        self.assertEqual(self.links(), [ext, N1, N2])
+        self.assertTrue(self.sing_box_alive())
+
+    def test_no_previous_list_means_nothing_to_roll_back_to(self):
+        self.sub("one", self.BAD + "\n")
+        self.assertEqual(self.sync(), 1)
+        st, msg = self.status()
+        self.assertEqual(st, "error")
+        self.assertIn("вернуть нечего", msg)
+
+    def test_rollback_failure_is_reported_and_not_remembered(self):
+        """Podkop не поднялся и на прежнем списке: виноваты не ноды, отказ запоминать нельзя."""
+        self.sync()
+        n3 = N2.replace("n2.example.net", "n3.example.net").split("#")[0] + "#Three"
+        self.sub("one", N1 + "\n" + N2 + "\n" + n3 + "\n")          # набор хороший
+        self.flag("podkop_fail")                                      # но podkop сейчас не запускается вообще
+        self.assertEqual(self.sync(), 1)
+        self.assertEqual(self.links(), [N1, N2], "прежний список всё равно записан")
+        self.assertIn("ни на новых нодах, ни на прежних", self.status()[1])
+        self.assertFalse(os.path.exists(os.path.join(self.root, "etc", "podkop_sub.managed.d", "main.rejected")))
+        self.flag("podkop_fail", False)                               # причину устранили
+        self.assertEqual(self.sync(), 0)
+        self.assertEqual(self.links(), [N1, N2, n3], "хороший набор применяется при следующем запуске")
+
+    def test_write_failure_during_rollback_is_reported_honestly(self):
+        self.sync()
+        self.sub("one", N1 + "\n" + self.BAD + "\n")
+        # запись нового списка проходит, а при откате uci начинает отказывать
+        self._script(os.path.join(self.stub, "bin", "podkop"),
+                     '#!/bin/sh\ncase "$1" in get_sing_box_features) echo "[]"; exit 0;; show_version) echo v; exit 0;; esac\n'
+                     'echo "$*" >> "$STUB/podkop.log"\ntouch "$FAKE_UCI_DB.fail_add"\ntouch "$STUB/singbox_dead"\nexit 1\n')
+        self.assertEqual(self.sync(), 1)
+        msg = self.status()[1]
+        self.assertIn("вернуть прежний список не удалось", msg)
+        self.assertNotIn("был пуст", msg)
+        self.assertFalse(os.path.exists(os.path.join(self.root, "etc", "podkop_sub.managed.d", "main.rejected")))
+
+    def test_termination_signal_during_reload_does_not_skip_rollback(self):
+        self.sync()
+        self.sub("one", N1 + "\n" + N2 + "\n" + self.BAD + "\n")
+        self.flag("term_parent")                 # во время podkop reload процессу sync прилетает SIGTERM
+        self.sync()
+        self.assertEqual(self.links(), [N1, N2], "откат выполнен, несмотря на сигнал")
+        self.assertTrue(self.sing_box_alive())
+        self.assertEqual(self.status()[0], "error")
+        self.assertFalse(os.path.exists(os.path.join(self.root, "tmp", "podkop_sub.lock")))
+
+    def test_subscription_with_only_unsupported_nodes_does_not_block_others(self):
+        """Ровно сценарий инцидента: добавили вторую подписку, а в ней один xhttp."""
+        self.set_opt("podkop_sub", "config", "url", ["https://sub.test/one", "https://sub.test/two"])
+        self.sub("two", self.XH + "\n")
+        self.assertEqual(self.sync(), 0)
+        self.assertEqual(self.links(), [N1, N2])
+        st, msg = self.status()
+        self.assertEqual(st, "ok")
+        self.assertIn("#2=0(транспорт не поддерживается)", msg)
+        self.sub("one", N1 + "\n")              # первая подписка продолжает обновляться
+        self.assertEqual(self.sync(), 0)
+        self.assertEqual(self.links(), [N1])
+
+    def test_flapping_sing_box_is_not_taken_for_success(self):
+        """sing-box стартует и сразу падает, procd его перезапускает: pid каждый раз новый."""
+        self.sync()
+        self.sub("one", N1 + "\n")
+        self.flag("singbox_flapping")
+        self.assertEqual(self.sync(), 1)
+        self.assertEqual(self.status()[0], "error")
+
+    def test_dead_podkop_is_revived_when_nothing_changed(self):
+        self.sync()
+        self.flag("no_singbox")
+        self.assertEqual(self.sync(), 1)
+        self.assertIn("podkop не запускается", self.status()[1])
+        self.flag("no_singbox", False)
+        self.flag("singbox_dead")                # sing-box лежит, список не менялся; reload его поднимет
+        n = self.reloads()
+        self.assertEqual(self.sync(), 0)
+        self.assertEqual(self.reloads(), n + 1)
+        self.assertIn("Podkop не работал — перезапущен", self.status()[1])
+
+    def test_status_reports_running_sync(self):
+        self.assertFalse(json.loads(self.run_svc("status").stdout)["running"])
+        lock = os.path.join(self.root, "tmp", "podkop_sub.lock")
+        os.mkdir(lock)
+        with open(os.path.join(lock, "pid"), "w") as f:
+            f.write(str(os.getpid()))
+        self.assertTrue(json.loads(self.run_svc("status").stdout)["running"])
 
 
 class PackageScriptTests(SyncEnv):

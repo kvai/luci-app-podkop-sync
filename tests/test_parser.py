@@ -210,6 +210,31 @@ os.unlink(hf.name)
 check("health: parsed from clash api", h == {"main-1-out": True, "main-2-out": False, "main-3-out": False, "GLOBAL": False}, str(h))
 check("health: missing file -> None", ps.load_health("/nonexistent/x.json") is None)
 
+# 18) фильтр транспортов: то, что podkop не умеет, в список не попадает
+mixed_tr = ("vless://u-1@h1.example:443?type=tcp&security=none#a\n"
+            "vless://u-1@h2.example:443?type=xhttp&security=none&path=%2Fx#b\n"
+            "vless://u-1@h3.example:443?type=ws&security=tls&path=%2Fw#c\n"
+            "vless://u-1@h4.example:443?security=none#d\n")
+with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as tf:
+    tf.write(mixed_tr)
+def run_main(*argv):
+    out, err = io.StringIO(), io.StringIO()
+    old = sys.argv, sys.stdout, sys.stderr
+    sys.argv, sys.stdout, sys.stderr = ["podkop_sync.py"] + list(argv), out, err
+    try:
+        ps.main()
+    finally:
+        sys.argv, sys.stdout, sys.stderr = old
+    return out.getvalue(), err.getvalue()
+o, e = run_main("--transports", "tcp,raw,ws,grpc", tf.name)
+check("transports: xhttp dropped, default tcp kept", o.count("vless://") == 3 and "h2.example" not in o, o)
+check("transports: summary line for backend", "Пропущено из-за транспорта: 1 (xhttp: 1)" in e, e)
+o, e = run_main("--transports", "tcp,raw,ws,grpc,xhttp,splithttp", tf.name)
+check("transports: xhttp kept when allowed", o.count("vless://") == 4 and "Пропущено" not in e, o)
+o, e = run_main(tf.name)
+check("transports: no filter without the option", o.count("vless://") == 4)
+os.unlink(tf.name)
+
 print()
 print("FAILURES:", failures)
 sys.exit(1 if failures else 0)

@@ -672,6 +672,20 @@ class StickyTests(SyncEnv):
         self.assertEqual(self.links(), [again, N2])
         self.assertNotIn("не отвечают", self.status()[1])
 
+    def test_removed_subscription_does_not_leave_dead_counts(self):
+        """Убрали вторую подписку с лежащими нодами — в статусе не должно остаться «не отвечают: N»."""
+        self.set_opt("podkop_sub", "config", "url", ["https://sub.test/one", "https://sub.test/two"])
+        foreign = N2.replace("n2.example.net", "x7.example.net").replace("PBK_TWO", "PBK_X7").split("#")[0] + "#Foreign"
+        self.sub("two", foreign + "\n")
+        self.sync()
+        self.health(**{"main-1-out": 120, "main-2-out": 95, "main-3-out": None})
+        self.set_opt("podkop_sub", "config", "url", ["https://sub.test/one"])
+        self.assertEqual(self.sync(), 0)
+        self.assertEqual(self.links(), [N1, N2])
+        self.assertNotIn("не отвечают", self.status()[1])
+        with open(os.path.join(self.root, "etc", "podkop_sub.managed.d", "main.dead")) as f:
+            self.assertEqual(f.read().strip(), "")
+
     def test_changed_public_key_is_never_stuck(self):
         self.sync()
         self.health(**{"main-1-out": 120, "main-2-out": 95})

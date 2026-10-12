@@ -514,6 +514,7 @@ def apply_sticky(nodes, current_links, health, section, assume_working=False,
     frozen = frozen or set()
     consensus = consensus or {}
     own = set(repr(sticky_key(n)) for n in nodes if n.get("source", 1) <= 1)
+    present = set(repr(sticky_key(n)) for n in nodes)
     working = defaultdict(list)     # ключ ноды -> работающие текущие ноды с таким ключом
     for i, link in enumerate(current_links, 1):
         # podkop называет выходы <секция>-<номер ссылки>-out
@@ -528,7 +529,8 @@ def apply_sticky(nodes, current_links, health, section, assume_working=False,
             continue
         if not assume_working and not health.get("%s-%d-out" % (section, i)):
             key_text = repr(sticky_key(cur))
-            if dead_out is not None:
+            # ноду, которой в новом наборе уже нет (подписку убрали), неработающей не считаем
+            if dead_out is not None and key_text in present:
                 dead_out.append(key_text)
             if key_text not in frozen or (retry_own and key_text in own):
                 continue            # не работает впервые (или просят повторить) — свежие значения

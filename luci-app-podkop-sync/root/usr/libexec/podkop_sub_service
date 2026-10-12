@@ -15,7 +15,7 @@
 ROOT="${PODKOP_SUB_ROOT:-}"
 # Версия плагина (показывается в LuCI). Должна совпадать с PKG_VERSION в
 # Makefile — за этим следит tests/test_sync.py.
-VERSION="1.1.0"
+VERSION="1.2.0"
 # Номер сборки: GitHub Actions подставляет сюда и в PKG_RELEASE порядковый номер
 # запуска, чтобы каждая сборка была «новее» предыдущей и opkg обновлял пакет
 # поверх без удаления. «dev» — файлы выложены вручную (dev-deploy.sh).
@@ -108,20 +108,42 @@ store_registry() {
 	cp "$3" "$of.tmp" && mv "$of.tmp" "$of" || return 1
 }
 
+# Менеджер пакетов системы: apk (OpenWrt 25.12+) или opkg (24.10 и старше).
+pkg_manager() {
+	if command -v apk >/dev/null 2>&1 && [ -d "$ROOT/lib/apk/db" ]; then echo apk
+	elif command -v opkg >/dev/null 2>&1; then echo opkg
+	fi
+}
+
 # Проверка зависимостей: если бинарь есть — пропускаем; если нет — ставим
-# через opkg (актуально для ручной/git-установки; для .ipk зависимости уже
-# подтянуты). Список пар "пакет:бинарь". Возвращает 1, если что-то не удалось.
+# менеджером пакетов системы (актуально для ручной/git-установки; у пакета
+# зависимости уже подтянуты). Список пар "пакет:бинарь". Возвращает 1, если
+# что-то не удалось.
 check_deps() {
-	local pair pkg bin updated=0 missing=0
+	local pair pkg bin updated=0 missing=0 pm
+	pm="$(pkg_manager)"
 	for pair in python3-light:python3 curl:curl; do
 		pkg="${pair%%:*}"; bin="${pair##*:}"
 		command -v "$bin" >/dev/null 2>&1 && continue
-		log warn "dependency '$bin' ($pkg) not found — installing via opkg"
-		if [ "$updated" = 0 ]; then opkg update >/dev/null 2>&1; updated=1; fi
-		opkg install "$pkg" >/dev/null 2>&1
+		log warn "dependency '$bin' ($pkg) not found — installing via ${pm:-?}"
+		case "$pm" in
+			apk)
+				if [ "$updated" = 0 ]; then apk update >/dev/null 2>&1; updated=1; fi
+				apk add "$pkg" >/dev/null 2>&1
+				;;
+			opkg)
+				if [ "$updated" = 0 ]; then opkg update >/dev/null 2>&1; updated=1; fi
+				opkg install "$pkg" >/dev/null 2>&1
+				;;
+		esac
 		command -v "$bin" >/dev/null 2>&1 || { missing=1; log err "failed to install $pkg"; }
 	done
 	return $missing
+}
+
+# Установлен ли сам podkop: без него некуда писать ноды и нечего перезапускать.
+podkop_installed() {
+	command -v podkop >/dev/null 2>&1 && [ -x "$ROOT/etc/init.d/podkop" ]
 }
 
 # Состояние выходов sing-box (работает/нет) — из его Clash API, который включает
@@ -225,6 +247,13 @@ cmd_sync() {
 
 do_sync() {
 	load_cfg
+
+	# (0) без podkop делать нечего — говорим об этом прямо, а не «секция не найдена»
+	if ! podkop_installed; then
+		set_status "error" "Podkop не установлен — синхронизация невозможна. Установите Podkop и нажмите «Обновить сейчас»." ""
+		log err "podkop is not installed"
+		return 1
+	fi
 
 	# (2) целевая секция должна существовать в podkop
 	if [ -z "$(uci -q get "podkop.$SECTION" 2>/dev/null)" ]; then
@@ -477,13 +506,24 @@ do_sync() {
 		# список тот же, что уже стоит и работает, — прежний отказ неактуален
 		rm -f "$MANAGED_DIR/$SECTION.rejected"
 		local upnote=""
-		if podkop_should_run "$is_urltest" && ! singbox_running; then
+		if podkop_should_run "$is_urltest" && podkop_stopped; then
+			upnote=" Podkop остановлен — не запускался."
+			log info "podkop is stopped — not starting it"
+		elif podkop_should_run "$is_urltest" && ! singbox_running; then
 			# список не менялся, но sing-box не работает — поднимаем
 			log warn "sing-box is not running — reloading podkop"
-			if podkop reload >/dev/null 2>&1 && wait_singbox; then
+			if podkop reload >/dev/null 2>&1 && wait_singbox && ensure_dns; then
 				upnote=" Podkop не работал — перезапущен."
 			else
 				set_status "error" "${secwarn}Список нод не менялся, но podkop не запускается — проверьте: logread -e podkop. $summary" "$total"
+				return 1
+			fi
+		elif podkop_should_run "$is_urltest" && ! podkop_dns_active; then
+			# sing-box работает, а DNS роутера идёт мимо него: трафик в VPN не попадает
+			if ensure_dns; then
+				upnote=" DNS роутера не был направлен на Podkop — выполнен полный перезапуск."
+			else
+				set_status "error" "${secwarn}Список нод не менялся, но DNS роутера не направлен на Podkop, и перезапуск не помог — выполните: service podkop restart. $summary" "$total"
 				return 1
 			fi
 		fi
@@ -501,9 +541,11 @@ do_sync() {
 		{ podkop_fingerprint; stable_signature "$new"; } > "$WORK/attempt.sig"
 		if cmp -s "$WORK/attempt.sig" "$rejected"; then
 			local rjnote="работает прежний список"
-			if podkop_should_run "$is_urltest" && ! singbox_running; then
+			if podkop_should_run "$is_urltest" && podkop_stopped; then
+				rjnote="podkop остановлен"
+			elif podkop_should_run "$is_urltest" && ! singbox_running; then
 				log warn "sing-box is not running — reloading podkop with the current list"
-				podkop reload >/dev/null 2>&1 && wait_singbox \
+				podkop reload >/dev/null 2>&1 && wait_singbox && ensure_dns \
 					&& rjnote="podkop не работал и перезапущен на прежнем списке" \
 					|| rjnote="podkop НЕ работает и на прежнем списке — проверьте: logread -e podkop"
 			fi
@@ -561,6 +603,9 @@ do_sync() {
 	elif ! "$ROOT/etc/init.d/podkop" enabled >/dev/null 2>&1; then
 		rnote=" Podkop выключен — не перезапускался."
 		log info "podkop is disabled — no reload"
+	elif podkop_stopped; then
+		rnote=" Podkop остановлен — список записан и применится при запуске."
+		log info "podkop is stopped — list written, not starting it"
 	else
 		# podkop reload = полная остановка и запуск (nft, sing-box, DNS).
 		# Метка в логе: причину отказа ищем только среди строк после неё.
@@ -568,7 +613,15 @@ do_sync() {
 		logger -t podkop_sub "$mark"
 		if podkop reload >/dev/null 2>&1 && wait_singbox; then
 			rnote=" Podkop перезапущен."
-			rm -f "$rejected"
+			DNS_FIXED=0
+			if ensure_dns; then
+				[ "$DNS_FIXED" = 1 ] && rnote=" Podkop перезапущен полностью: DNS роутера не был направлен на него."
+				rm -f "$rejected"
+			else
+				# ноды тут ни при чём, поэтому список не откатываем
+				slvl="error"
+				rnote=" Ноды записаны, но DNS роутера не направлен на Podkop, и перезапуск не помог — выполните: service podkop restart."
+			fi
 		else
 			# Podkop не поднялся на новых нодах, а с ним лежит DNS всей сети.
 			# Возвращаем прежний список.
@@ -586,7 +639,7 @@ do_sync() {
 				if [ -f "$WORK/registry.old" ]; then cp "$WORK/registry.old" "$mf"; else rm -f "$mf"; fi
 				if [ -f "$WORK/origins.old" ]; then cp "$WORK/origins.old" "$(origins_file "$SECTION")"; else rm -f "$(origins_file "$SECTION")"; fi
 				total=$(count_lines "$cur")
-				if podkop reload >/dev/null 2>&1 && wait_singbox; then
+				if podkop reload >/dev/null 2>&1 && wait_singbox && ensure_dns; then
 					# Прежний список поднялся, новый — нет: значит, дело именно в новых
 					# нодах. Только в этом случае запоминаем набор как отвергнутый.
 					mkdir -p "$MANAGED_DIR" && { podkop_fingerprint; stable_signature "$new"; } > "$rejected"
@@ -631,12 +684,57 @@ podkop_should_run() {
 	[ "$1" = 1 ] && "$ROOT/etc/init.d/podkop" enabled >/dev/null 2>&1
 }
 
+# Направлен ли DNS роутера на sing-box. `podkop start` настраивает dnsmasq на
+# 127.0.0.42, `podkop stop` возвращает прежние серверы, а `podkop reload` dnsmasq
+# не трогает вовсе. С dont_touch_dhcp=1 podkop в dnsmasq не вмешивается — тогда
+# по нему ничего сказать нельзя, считаем, что всё в порядке.
+podkop_dns_active() {
+	[ "$(uci -q get podkop.settings.dont_touch_dhcp 2>/dev/null)" = 1 ] && return 0
+	uci -q get 'dhcp.@dnsmasq[0].server' 2>/dev/null | grep -q '127\.0\.0\.42'
+}
+
+# Podkop остановлен штатно (`service podkop stop`): sing-box не работает, и DNS
+# возвращён провайдеру. Поднимать его через `podkop reload` нельзя: nft и sing-box
+# запустятся, а DNS останется мимо — ноды «зелёные», а трафик в VPN не идёт.
+# Упавший sing-box выглядит иначе: DNS по-прежнему смотрит на 127.0.0.42.
+# Сам podkop помечает это флагом: `stop` пишет shutdown_correctly=1, `start` — 0,
+# `reload` флаг не трогает. Флаг надёжнее DNS (он есть и при dont_touch_dhcp=1);
+# по DNS судим, только если флага нет вовсе.
+podkop_stopped() {
+	singbox_running && return 1
+	case "$(uci -q get podkop.settings.shutdown_correctly 2>/dev/null)" in
+		1) return 0 ;;
+		0) return 1 ;;
+	esac
+	! podkop_dns_active
+}
+
+# DNS обязан смотреть на sing-box. Если нет (podkop подняли наполовину) — делаем
+# полный перезапуск службы: он настраивает dnsmasq. Запуск идёт под procd в фоне,
+# поэтому ждём и sing-box, и сам DNS. 0 — DNS в порядке (DNS_FIXED=1, если для
+# этого понадобился перезапуск), 1 — направить DNS на podkop не удалось.
+ensure_dns() {
+	podkop_dns_active && return 0
+	log warn "dnsmasq does not point to sing-box — full podkop restart"
+	"$ROOT/etc/init.d/podkop" restart >/dev/null 2>&1
+	wait_singbox 40 || return 1
+	local i=0
+	while [ $i -lt 20 ]; do
+		podkop_dns_active && { DNS_FIXED=1; return 0; }
+		sleep 1
+		i=$((i + 1))
+	done
+	log err "dnsmasq still does not point to sing-box after the restart"
+	return 1
+}
+
 # sing-box должен подняться после reload и НЕ упасть сразу: считаем его живым,
 # только когда три проверки подряд (с интервалом в секунду) видят один и тот же
 # процесс. Иначе procd-перезапуск падающего sing-box выглядел бы как успех.
 wait_singbox() {
-	local i=0 p last="" same=0
-	while [ $i -lt 25 ]; do
+	# $1 — сколько секунд ждать (по умолчанию 25; после полного перезапуска — дольше)
+	local i=0 p last="" same=0 max="${1:-25}"
+	while [ $i -lt "$max" ]; do
 		p=$(pidof sing-box 2>/dev/null)
 		if [ -n "$p" ] && [ "$p" = "$last" ]; then
 			same=$((same + 1))
@@ -738,8 +836,10 @@ cmd_status() {
 	local running="false" lpid
 	lpid=$(cat "$LOCK/pid" 2>/dev/null)
 	[ -n "$lpid" ] && kill -0 "$lpid" 2>/dev/null && running="true"
-	printf '{"running":%s,"version":"%s","status":"%s","message":"%s","last_update":%s,"count":%s,"sub":%s,"manual":%s,"section":"%s","nodes":[%s]}\n' \
-		"$running" "$VERSION-$([ "$RELEASE" = dev ] && echo dev || echo "r$RELEASE")" \
+	local hasp="true"
+	podkop_installed || hasp="false"
+	printf '{"running":%s,"podkop":%s,"version":"%s","status":"%s","message":"%s","last_update":%s,"count":%s,"sub":%s,"manual":%s,"section":"%s","nodes":[%s]}\n' \
+		"$running" "$hasp" "$VERSION-$([ "$RELEASE" = dev ] && echo dev || echo "r$RELEASE")" \
 		"$(printf '%s' "$st" | json_escape)" \
 		"$(printf '%s' "$ms" | json_escape)" \
 		"${up:-0}" "$cnt" "${sub:-0}" "${man:-0}" "$(printf '%s' "$SECTION" | json_escape)" \

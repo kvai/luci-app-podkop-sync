@@ -194,7 +194,9 @@ return view.extend({
 	load: function() {
 		return Promise.all([
 			uci.load('podkop_sub'),
-			uci.load('podkop'),
+			/* podkop может быть не установлен — тогда его конфига нет; страница
+			   всё равно должна открыться и сказать об этом */
+			uci.load('podkop').catch(function() { return null; }),
 			callStatus().catch(function() { return {}; })
 		]);
 	},
@@ -374,6 +376,10 @@ return view.extend({
 					'click': ui.createHandlerFn(this, onSyncNow)
 				}, _('Обновить сейчас'))
 			]),
+			(status.podkop === false) ? E('div', { 'class': 'alert-message warning' }, [
+				_('Podkop не установлен: синхронизация не работает, ноды записывать некуда. ' +
+				  'Установите Podkop и обновите страницу.')
+			]) : '',
 			E('div', { 'class': 'pks-card' }, statusBox)
 		]);
 

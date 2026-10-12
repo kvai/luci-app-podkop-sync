@@ -176,8 +176,12 @@ class SyncEnv(unittest.TestCase):
                      '[ -f "$STUB/singbox_flapping" ] && { date +%N%s; exit 0; }\necho 4242\nexit 0\n')
         self._script(os.path.join(b, "sleep"), "#!/bin/sh\nexit 0\n")
         self._script(os.path.join(b, "logger"), '#!/bin/sh\necho "$*" >> "$STUB/syslog"\n')
+        # init-скрипт podkop: «restart» настраивает dnsmasq на sing-box, как настоящий `podkop start`
         self._script(os.path.join(self.root, "etc", "init.d", "podkop"),
-                     '#!/bin/sh\n[ "$1" = enabled ] && { [ -f "$STUB/podkop_disabled" ] && exit 1; exit 0; }\nexit 0\n')
+                     '#!/bin/sh\n[ "$1" = enabled ] && { [ -f "$STUB/podkop_disabled" ] && exit 1; exit 0; }\n'
+                     'echo "$1" >> "$STUB/initd.log"\n'
+                     '[ "$1" = restart ] && [ ! -f "$STUB/restart_no_dns" ] && '
+                     '{ uci set "dhcp.@dnsmasq[0].server=127.0.0.42"; uci commit dhcp; }\nexit 0\n')
         self._script(os.path.join(self.root, "etc", "init.d", "cron"),
                      '#!/bin/sh\necho "$1" >> "$STUB/cron.log"\n')
         # Заглушка пробной сборки (настоящая подключает /usr/bin/podkop и проверяется на роутере).
@@ -209,6 +213,8 @@ class SyncEnv(unittest.TestCase):
         os.chmod(path, 0o755)
 
     def write_db(self, data):
+        # как на работающем роутере: podkop направил dnsmasq на sing-box
+        data.setdefault("dhcp", {"@dnsmasq[0]": {".type": "dnsmasq", "server": ["127.0.0.42"]}})
         with open(self.db, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
         if os.path.exists(self.db + ".staged"):
@@ -1024,6 +1030,164 @@ class ProtectionTests(SyncEnv):
         with open(os.path.join(lock, "pid"), "w") as f:
             f.write(str(os.getpid()))
         self.assertTrue(json.loads(self.run_svc("status").stdout)["running"])
+
+
+class PodkopStateTests(SyncEnv):
+    """Podkop не установлен / остановлен штатно / поднят наполовину (DNS мимо sing-box)."""
+
+    def dns_to_provider(self):
+        self.set_opt("dhcp", "@dnsmasq[0]", "server", ["77.37.251.33"])
+
+    def test_missing_podkop_is_reported_and_nothing_is_written(self):
+        os.remove(os.path.join(self.stub, "bin", "podkop"))
+        os.remove(os.path.join(self.root, "etc", "init.d", "podkop"))
+        self.assertEqual(self.sync(), 1)
+        st, msg = self.status()
+        self.assertEqual(st, "error")
+        self.assertIn("Podkop не установлен", msg)
+        self.assertEqual(self.links(), [])
+        self.assertEqual(self.log("curl.log"), [], "без podkop подписку даже не скачиваем")
+        self.assertIs(json.loads(self.run_svc("status").stdout)["podkop"], False)
+
+    def test_status_reports_podkop_present(self):
+        self.assertIs(json.loads(self.run_svc("status").stdout)["podkop"], True)
+
+    def test_stopped_podkop_gets_the_list_but_is_not_started(self):
+        """`service podkop stop`: sing-box не работает, DNS возвращён провайдеру. `podkop reload`
+        поднял бы nft и sing-box, а DNS остался бы мимо — ноды живые, трафик в VPN не идёт."""
+        self.flag("no_singbox")
+        self.dns_to_provider()
+        self.assertEqual(self.sync(), 0)
+        st, msg = self.status()
+        self.assertEqual(st, "ok", msg)
+        self.assertIn("Podkop остановлен — список записан", msg)
+        self.assertEqual(len(self.links()), 2)
+        self.assertEqual(self.reloads(), 0)
+        self.assertEqual(self.log("initd.log"), [])
+
+    def test_stopped_podkop_is_not_started_when_nothing_changed(self):
+        self.sync()
+        n = self.reloads()
+        self.flag("no_singbox")
+        self.dns_to_provider()
+        self.assertEqual(self.sync(), 0)
+        self.assertIn("Podkop остановлен — не запускался", self.status()[1])
+        self.assertEqual(self.reloads(), n)
+
+    def test_crashed_singbox_is_still_revived(self):
+        """sing-box упал, а DNS по-прежнему смотрит на 127.0.0.42 — это не штатная остановка."""
+        self.sync()
+        self.flag("singbox_dead")
+        n = self.reloads()
+        self.assertEqual(self.sync(), 0)
+        self.assertEqual(self.reloads(), n + 1)
+        self.assertIn("Podkop не работал — перезапущен", self.status()[1])
+
+    def test_half_started_podkop_gets_a_full_restart(self):
+        """sing-box работает, но DNS мимо него (podkop когда-то подняли через reload после stop):
+        после reload плагин обязан довести дело до конца полным перезапуском службы."""
+        self.dns_to_provider()
+        self.assertEqual(self.sync(), 0)
+        st, msg = self.status()
+        self.assertEqual(st, "ok", msg)
+        self.assertEqual(self.reloads(), 1)
+        self.assertEqual(self.log("initd.log"), ["restart"])
+        self.assertIn("перезапущен полностью", msg)
+        self.assertEqual(self.read_db()["dhcp"]["@dnsmasq[0]"]["server"], "127.0.0.42")
+
+    def test_half_started_podkop_is_fixed_even_when_nothing_changed(self):
+        """Самый частый прогон — «без изменений»: и в нём DNS мимо sing-box надо чинить."""
+        self.sync()
+        self.dns_to_provider()
+        n = self.reloads()
+        self.assertEqual(self.sync(), 0)
+        self.assertEqual(self.reloads(), n)
+        self.assertEqual(self.log("initd.log"), ["restart"])
+        self.assertIn("выполнен полный перезапуск", self.status()[1])
+
+    def test_restart_that_does_not_fix_dns_is_an_error(self):
+        self.flag("restart_no_dns")
+        self.dns_to_provider()
+        self.assertEqual(self.sync(), 1)       # ноды применены, но это ошибка
+        st, msg = self.status()
+        self.assertEqual(st, "error", msg)
+        self.assertIn("DNS роутера не направлен на Podkop", msg)
+        self.assertEqual(len(self.links()), 2, "ноды тут ни при чём — список не откатывается")
+        self.assertEqual(self.sync(), 1)       # и повторный прогон «без изменений» не притворяется успехом
+        self.assertEqual(self.status()[0], "error")
+
+    def _settings(self, **kv):
+        d = self.read_db()
+        d["podkop"].setdefault("settings", {".type": "settings"}).update(kv)
+        self.write_db(d)
+
+    def test_shutdown_flag_marks_a_stopped_podkop_even_without_dns_control(self):
+        """dont_touch_dhcp=1: по DNS ничего не понять, но podkop сам пишет shutdown_correctly=1."""
+        self._settings(dont_touch_dhcp="1", shutdown_correctly="1")
+        self.flag("no_singbox")
+        self.assertEqual(self.sync(), 0)
+        self.assertIn("Podkop остановлен — список записан", self.status()[1])
+        self.assertEqual(self.reloads(), 0)
+
+    def test_shutdown_flag_zero_means_crashed_not_stopped(self):
+        self.sync()
+        self._settings(shutdown_correctly="0")
+        self.dns_to_provider()                 # даже если DNS выглядит «возвращённым»
+        self.flag("singbox_dead")
+        n = self.reloads()
+        self.assertEqual(self.sync(), 0)
+        self.assertEqual(self.reloads(), n + 1)
+
+    def test_dont_touch_dhcp_means_dns_is_not_our_business(self):
+        d = self.read_db()
+        d["podkop"]["settings"] = {".type": "settings", "dont_touch_dhcp": "1"}
+        self.write_db(d)
+        self.dns_to_provider()
+        self.assertEqual(self.sync(), 0)
+        self.assertEqual(self.log("initd.log"), [])
+        self.assertIn("Podkop перезапущен.", self.status()[1])
+
+
+class PackageManagerTests(SyncEnv):
+    def test_cleanup_covers_both_package_managers(self):
+        with open(os.path.join(PKG, "etc", "uci-defaults", "luci-app-podkop-sync"), encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("/etc/config/podkop_sub-opkg", src)
+        self.assertIn("/etc/config/podkop_sub.apk-new", src)
+
+    def test_registry_survives_sysupgrade(self):
+        with open(os.path.join(HERE, "..", "luci-app-podkop-sync", "Makefile"), encoding="utf-8") as f:
+            mk = f.read()
+        conf = mk.split("define Package/luci-app-podkop-sync/conffiles\n", 1)[1].split("\nendef", 1)[0]
+        self.assertEqual(conf.split(), ["/etc/config/podkop_sub", "/etc/podkop_sub.managed.d/"])
+
+    def test_release_number_is_numeric_for_apk(self):
+        """apk принимает выпуск только вида -r<число>; CI подставляет номер запуска."""
+        with open(os.path.join(HERE, "..", "luci-app-podkop-sync", "Makefile"), encoding="utf-8") as f:
+            rel = [l.split(":=")[1].strip() for l in f if l.startswith("PKG_RELEASE:=")][0]
+        self.assertTrue(rel.isdigit(), rel)
+        with open(os.path.join(HERE, "..", ".github", "workflows", "build.yml"), encoding="utf-8") as f:
+            wf = f.read()
+        self.assertIn("ext: ipk", wf)
+        self.assertIn("ext: apk", wf)
+
+    def test_package_manager_is_detected(self):
+        """apk — только вместе со своей базой /lib/apk/db; иначе opkg."""
+        b = os.path.join(self.stub, "bin")
+        for pm in ("apk", "opkg"):
+            self._script(os.path.join(b, pm), '#!/bin/sh\necho "%s $*" >> "$STUB/pm.log"\nexit 0\n' % pm)
+        with open(SERVICE, encoding="utf-8") as f:
+            src = f.read()
+        fn = src.split("pkg_manager() {", 1)[1].split("\n}\n", 1)[0]
+        probe = os.path.join(self.root, "pm_probe")
+        self._script(probe, "#!/bin/sh\npkg_manager() {" + fn + "\n}\npkg_manager\n")
+        env = dict(self.env, PATH=b + os.pathsep + "/usr/bin:/bin", ROOT=self.root)
+        self.assertEqual(subprocess.run(["sh", probe], env=env, capture_output=True, text=True).stdout.strip(), "opkg",
+                         "apk без своей базы — не признак OpenWrt 25.12")
+        os.makedirs(os.path.join(self.root, "lib", "apk", "db"))
+        self.assertEqual(subprocess.run(["sh", probe], env=env, capture_output=True, text=True).stdout.strip(), "apk")
+        os.remove(os.path.join(b, "apk"))
+        self.assertEqual(subprocess.run(["sh", probe], env=env, capture_output=True, text=True).stdout.strip(), "opkg")
 
 
 class OriginsTests(SyncEnv):

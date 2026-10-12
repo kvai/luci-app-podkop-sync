@@ -16,17 +16,22 @@ permissions:
 
 jobs:
   build:
-    name: Build ${{ matrix.arch }}
+    name: Build ${{ matrix.ext }} (${{ matrix.sdk }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
           # Xiaomi Mi Router AX3000T — MediaTek MT7981B (mediatek/filogic).
-          # Пакет PKGARCH=all — один .ipk ставится на любой 24.10.x,
+          # Пакет PKGARCH=all — один файл ставится на любой роутер ветки,
           # поэтому берём rolling-тег ветки, а не конкретный минор.
+          # SDK 24.10 собирает .ipk (opkg), SDK 25.12 — .apk (apk).
           - arch: aarch64_cortex-a53
             sdk: 24.10-SNAPSHOT
+            ext: ipk
+          - arch: aarch64_cortex-a53
+            sdk: 25.12-SNAPSHOT
+            ext: apk
 
     steps:
       - name: Checkout
@@ -41,8 +46,9 @@ jobs:
           python3 tests/test_parser.py
           python3 -m unittest discover -s tests -p 'test_sync.py'
 
-      # Каждая сборка получает растущий номер выпуска (1.1.0-r<номер запуска>):
-      # opkg видит её как более новую и обновляет поверх, без opkg remove.
+      # Каждая сборка получает растущий номер выпуска (<версия>-r<номер запуска>):
+      # менеджер пакетов видит её как более новую и обновляет поверх, без удаления.
+      # Номер обязан быть числом: apk другой формат выпуска не принимает.
       # Тот же номер попадает в скрипт и показывается в интерфейсе.
       - name: Stamp build number
         run: |
@@ -67,18 +73,19 @@ jobs:
           find bin/ -name '*.apk' -exec cp -v {} artifacts/ \; || true
           ls -l artifacts/
           # стабильное имя ассета для install.sh (releases/download/latest/...)
-          ipk="$(find artifacts -name 'luci-app-podkop-sync*.ipk' | head -1)"
-          [ -n "$ipk" ] && cp -v "$ipk" artifacts/luci-app-podkop-sync.ipk
+          pkg="$(find artifacts -name 'luci-app-podkop-sync*.${{ matrix.ext }}' | head -1)"
+          [ -n "$pkg" ] || { echo "пакет .${{ matrix.ext }} не собран"; exit 1; }
+          cp -v "$pkg" artifacts/luci-app-podkop-sync.${{ matrix.ext }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
-          name: luci-app-podkop-sync-${{ matrix.arch }}
+          name: luci-app-podkop-sync-${{ matrix.ext }}
           path: artifacts/*
           if-no-files-found: error
 
-      # Публикуем rolling-релиз 'latest' со стабильным именем .ipk,
-      # чтобы install.sh качал его по постоянному URL.
+      # Публикуем rolling-релиз 'latest' со стабильными именами .ipk и .apk,
+      # чтобы install.sh качал нужный формат по постоянному URL.
       - name: Publish rolling release 'latest'
         if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
         uses: softprops/action-gh-release@v3
@@ -86,4 +93,4 @@ jobs:
           tag_name: latest
           name: latest
           prerelease: true
-          files: artifacts/luci-app-podkop-sync.ipk
+          files: artifacts/luci-app-podkop-sync.${{ matrix.ext }}

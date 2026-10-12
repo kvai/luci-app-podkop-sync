@@ -5,7 +5,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-podkop-sync
-PKG_VERSION:=1.1.0
+PKG_VERSION:=1.2.0
 PKG_RELEASE:=1
 
 PKG_MAINTAINER:=htckvai <htckvai@gmail.com>
@@ -16,18 +16,22 @@ LUCI_DEPENDS:=+python3-light +curl +podkop
 LUCI_PKGARCH:=all
 
 # Настройки пользователя (URL подписок, ручные ноды) — conffile: без этого
-# объявления opkg при обновлении пакета перезаписывал бы их умолчаниями.
+# объявления менеджер пакетов при обновлении перезаписывал бы их умолчаниями.
+# Каталог реестра своих нод объявлен там же, чтобы он переживал sysupgrade
+# (список conffiles попадает в /lib/upgrade/keep.d).
 define Package/luci-app-podkop-sync/conffiles
 /etc/config/podkop_sub
+/etc/podkop_sub.managed.d/
 endef
 
 # Чистое удаление: снять cron-задачу, отключить сервис, убрать реестр.
-# Выполняется на устройстве при `opkg remove` (не при сборке образа).
+# Выполняется на устройстве при удалении пакета (не при сборке образа).
 # При ОБНОВЛЕНИИ opkg тоже зовёт prerm — тогда ничего не трогаем, иначе пропал
 # бы реестр своих нод и cron-задача. Признак обновления — переменная
 # PKG_UPGRADE=1: сценарий подключается системной default_prerm через «.», и
 # позиционные аргументы в нём не «upgrade», а путь к обёртке (проверка "$$1"
-# в 1.1.0-r1..r14 поэтому не срабатывала).
+# в 1.1.0-r1..r14 поэтому не срабатывала). apk (OpenWrt 25.12+) при обновлении
+# prerm не вызывает вовсе, так что там эта защита просто не нужна.
 define Package/luci-app-podkop-sync/prerm
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT}" ] && exit 0

@@ -1,6 +1,6 @@
 # luci-app-podkop-sync
 
-Лёгкий пакет для OpenWrt 24.10, который скачивает прокси-подписки, парсит их в
+Лёгкий пакет для OpenWrt 24.10 (opkg) и 25.12 (apk), который скачивает прокси-подписки, парсит их в
 `vless://`-ссылки и применяет к секции [Podkop](https://github.com/itdoginfo/podkop)
 в режиме **URLTest** — с управлением через веб-интерфейс LuCI.
 
@@ -30,6 +30,11 @@
   если проверка недоступна или podkop всё же не поднялся, плагин сам возвращает прежний список и сообщает причину;
   отвергнутый набор по расписанию повторно не применяется (отметка живёт неделю и снимается при
   изменении подписки или обновлении podkop; кнопка «Обновить сейчас» её игнорирует).
+- Остановленный podkop (`service podkop stop`) плагин не запускает: список записывается и применится
+  при запуске. После любого перезапуска проверяется, что DNS роутера направлен на sing-box; если нет
+  (podkop поднят наполовину — ноды «зелёные», а трафик идёт мимо VPN), выполняется полный перезапуск службы.
+- Если podkop не установлен, синхронизация и страница в LuCI сообщают об этом, ничего не записывая.
+- Реестр своих нод (`/etc/podkop_sub.managed.d/`) и настройки переживают sysupgrade с сохранением настроек.
 - Cron-расписание (6/12/24 ч), кнопка «Обновить сейчас», статус и таблица активных нод.
 
 ## Компоненты
@@ -53,8 +58,11 @@
 wget -O - https://raw.githubusercontent.com/kvai/luci-app-podkop-sync/main/install.sh | sh
 ```
 
-`install.sh` качает готовый `.ipk` из GitHub Release `latest` и ставит через
-`opkg` (зависимости подтянутся сами).
+Команда одна для любой версии OpenWrt: `install.sh` сам определяет менеджер
+пакетов, качает из GitHub Release `latest` файл нужного формата (`.ipk` для opkg на
+24.10 и старше, `.apk` для apk на 25.12+) и ставит его; зависимости подтянутся
+сами. Той же командой пакет обновляется поверх установленного. Если podkop не
+установлен, установщик скажет об этом и ничего не поставит.
 
 > **Публичный vs приватный.** Анонимный one-liner работает только с **публичным**
 > репозиторием (raw-скрипт и Release-ассеты). Для **приватного** нужен токен
@@ -70,8 +78,10 @@ wget -O - https://raw.githubusercontent.com/kvai/luci-app-podkop-sync/main/insta
 2. **Upload Package…** → выбрать `.ipk` → **Install** (зависимости ставятся сами).
 3. Обновить LuCI → **Сервисы → Podkop Sync**.
 
+На OpenWrt 25.12 вручную: `apk add --allow-untrusted /tmp/luci-app-podkop-sync.apk`.
+
 Удаление: **System → Software → Installed** → `luci-app-podkop-sync` → **Remove**
-(или `opkg remove luci-app-podkop-sync`). prerm-скрипт снимает cron-задачу,
+(или `opkg remove luci-app-podkop-sync` / `apk del luci-app-podkop-sync`). prerm-скрипт снимает cron-задачу,
 отключает сервис и чистит реестр управляемых нод.
 
 Обновление — той же командой установки, поверх, без `opkg remove`: каждая сборка
@@ -86,10 +96,11 @@ wget -O - https://raw.githubusercontent.com/kvai/luci-app-podkop-sync/main/insta
 
 ## Сборка (CI)
 
-`.github/workflows/build.yml` собирает `.ipk` через OpenWrt SDK
-(`aarch64_cortex-a53`, тег ветки `24.10-SNAPSHOT`; пакет `all` — ставится на
-любой 24.10.x) и публикует его в rolling-релиз `latest` со стабильным именем
-`luci-app-podkop-sync.ipk`. Артефакт также доступен во вкладке **Actions**.
+`.github/workflows/build.yml` собирает пакет двумя OpenWrt SDK
+(`aarch64_cortex-a53`; пакет `all` — ставится на любую архитектуру): тег
+`24.10-SNAPSHOT` даёт `.ipk`, тег `25.12-SNAPSHOT` — `.apk`. Оба публикуются в
+rolling-релиз `latest` под стабильными именами `luci-app-podkop-sync.ipk` и
+`luci-app-podkop-sync.apk`. Артефакт также доступен во вкладке **Actions**.
 
 ## Ручная установка для теста (без CI)
 

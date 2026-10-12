@@ -41,10 +41,14 @@ jobs:
       - name: Run tests
         env:
           PYTHONUTF8: "1"       # тесты и скрипты работают с кириллицей
+          # без этого python оставляет рядом с парсером __pycache__, и он попадает в пакет
+          PYTHONDONTWRITEBYTECODE: "1"
           LC_ALL: C.UTF-8
         run: |
           python3 tests/test_parser.py
           python3 -m unittest discover -s tests -p 'test_sync.py'
+          find luci-app-podkop-sync -name '__pycache__' -prune -exec rm -rf {} +
+          test -z "$(find luci-app-podkop-sync -name '*.pyc')"
 
       # Каждая сборка получает растущий номер выпуска (<версия>-r<номер запуска>):
       # менеджер пакетов видит её как более новую и обновляет поверх, без удаления.

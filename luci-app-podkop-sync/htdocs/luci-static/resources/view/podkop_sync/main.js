@@ -117,6 +117,14 @@ function renderStatusInner(st) {
 	var ok = (st.status === 'ok'), err = (st.status === 'error'), warn = (st.status === 'warn');
 	var color = ok ? '#3fb950' : (err ? '#f85149' : (warn ? '#d29922' : '#8b949e'));
 	var label = ok ? _('OK') : (err ? _('Ошибка') : (warn ? _('Внимание') : _('не запускалось')));
+	/* куда сейчас идёт трафик сети: главное, что нужно знать после обновления подписки */
+	var routes = {
+		podkop:  [ '#3fb950', _('Трафик идёт через Podkop') ],
+		direct:  [ '#f85149', _('Трафик идёт мимо Podkop, напрямую') ],
+		down:    [ '#f85149', _('Podkop не запущен') ],
+		stopped: [ '#8b949e', _('Podkop остановлен') ]
+	};
+	var route = routes[st.route];
 
 	return [
 		E('div', { 'class': 'pks-tiles' }, [
@@ -128,6 +136,9 @@ function renderStatusInner(st) {
 				E('div', { 'class': 'v', 'style': 'font-size:15px;display:flex;align-items:center;gap:7px' }, [
 					E('span', { 'class': 'pks-dot', 'style': 'background:' + color }), label
 				]),
+				route ? E('div', { 'style': 'font-size:12px;margin-top:3px;display:flex;align-items:center;gap:7px' }, [
+					E('span', { 'class': 'pks-dot', 'style': 'margin-right:0;flex:none;background:' + route[0] }), route[1]
+				]) : '',
 				E('div', { 'style': 'font-size:11px;opacity:.7;margin-top:2px' }, [ String(fmtTime(st.last_update)) ])
 			])
 		]),

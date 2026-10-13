@@ -175,6 +175,11 @@ class SyncEnv(unittest.TestCase):
                      '#!/bin/sh\n[ -f "$STUB/no_singbox" ] && exit 1\n[ -f "$STUB/singbox_dead" ] && exit 1\n'
                      '[ -f "$STUB/singbox_flapping" ] && { date +%N%s; exit 0; }\necho 4242\nexit 0\n')
         self._script(os.path.join(b, "sleep"), "#!/bin/sh\nexit 0\n")
+        # DNS роутера: по умолчанию отвечает поддельным адресом sing-box, как при работающем podkop
+        self._script(os.path.join(b, "nslookup"),
+                     '#!/bin/sh\necho "$*" >> "$STUB/nslookup.log"\n[ -f "$STUB/dns_dead" ] && exit 1\n'
+                     'echo "Server: 127.0.0.1"; echo "Address: 127.0.0.1:53"; echo; echo "Name: fakeip.podkop.fyi"\n'
+                     'if [ -f "$STUB/dns_real" ]; then echo "Address: 93.184.216.34"; else echo "Address: 198.18.0.7"; fi\n')
         self._script(os.path.join(b, "logger"), '#!/bin/sh\necho "$*" >> "$STUB/syslog"\n')
         # init-скрипт podkop: «restart» настраивает dnsmasq на sing-box, как настоящий `podkop start`
         self._script(os.path.join(self.root, "etc", "init.d", "podkop"),
@@ -1146,6 +1151,48 @@ class PodkopStateTests(SyncEnv):
         self.assertEqual(self.sync(), 0)
         self.assertEqual(self.log("initd.log"), [])
         self.assertIn("Podkop перезапущен.", self.status()[1])
+
+
+class RouteStateTests(SyncEnv):
+    """Плитка «Статус»: куда сейчас идёт трафик сети."""
+
+    def route(self):
+        return json.loads(self.run_svc("status").stdout)["route"]
+
+    def test_fakeip_answer_means_traffic_goes_through_podkop(self):
+        self.assertEqual(self.route(), "podkop")
+        self.assertIn("fakeip.podkop.fyi 127.0.0.1", self.log("nslookup.log")[0])
+
+    def test_real_answer_means_traffic_bypasses_podkop(self):
+        """sing-box работает, но DNS отдаёт настоящие адреса — та самая «полуподнятая» поломка."""
+        self.flag("dns_real")
+        self.assertEqual(self.route(), "direct")
+
+    def test_no_dns_answer_is_not_reported_as_working(self):
+        self.flag("dns_dead")
+        self.assertEqual(self.route(), "direct")
+
+    def test_crashed_singbox(self):
+        self.flag("no_singbox")
+        self.assertEqual(self.route(), "down")
+
+    def test_stopped_podkop(self):
+        self.flag("no_singbox")
+        self.set_opt("dhcp", "@dnsmasq[0]", "server", ["77.37.251.33"])
+        self.assertEqual(self.route(), "stopped")
+
+    def test_missing_podkop(self):
+        os.remove(os.path.join(self.stub, "bin", "podkop"))
+        self.assertEqual(self.route(), "none")
+
+    def test_not_checked_while_sync_is_running(self):
+        os.makedirs(os.path.join(self.root, "tmp", "podkop_sub.lock"))
+        with open(os.path.join(self.root, "tmp", "podkop_sub.lock", "pid"), "w") as f:
+            f.write(str(os.getpid()))
+        st = json.loads(self.run_svc("status").stdout)
+        self.assertTrue(st["running"])
+        self.assertEqual(st["route"], "")
+        self.assertEqual(self.log("nslookup.log"), [])
 
 
 class PackageManagerTests(SyncEnv):

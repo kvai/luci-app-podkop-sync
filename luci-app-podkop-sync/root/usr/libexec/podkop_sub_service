@@ -15,7 +15,7 @@
 ROOT="${PODKOP_SUB_ROOT:-}"
 # Версия плагина (показывается в LuCI). Должна совпадать с PKG_VERSION в
 # Makefile — за этим следит tests/test_sync.py.
-VERSION="1.2.0"
+VERSION="1.2.1"
 # Номер сборки: GitHub Actions подставляет сюда и в PKG_RELEASE порядковый номер
 # запуска, чтобы каждая сборка была «новее» предыдущей и opkg обновлял пакет
 # поверх без удаления. «dev» — файлы выложены вручную (dev-deploy.sh).
@@ -728,6 +728,24 @@ ensure_dns() {
 	return 1
 }
 
+# Куда сейчас уходит трафик сети — для плитки «Статус» в интерфейсе:
+#   podkop  — DNS роутера отвечает поддельными адресами sing-box: трафик идёт через Podkop
+#   direct  — sing-box работает, но DNS идёт мимо него: трафик идёт напрямую, мимо VPN
+#   down    — Podkop должен работать, а sing-box не запущен
+#   stopped — Podkop остановлен штатно
+#   none    — Podkop не установлен
+# Проверка настоящая: спрашиваем у dnsmasq служебное имя Podkop и смотрим, вернулся ли
+# адрес из диапазона FakeIP (198.18.0.0/15). Так же проверяет себя диагностика Podkop.
+route_state() {
+	podkop_installed || { echo none; return; }
+	podkop_stopped && { echo stopped; return; }
+	singbox_running || { echo down; return; }
+	case "$(nslookup -timeout=2 fakeip.podkop.fyi 127.0.0.1 2>/dev/null | sed -n 's/^Address[^:]*: *\(198\.1[89]\.[0-9.]*\).*/\1/p' | head -n 1)" in
+		198.18.*|198.19.*) echo podkop ;;
+		*) echo direct ;;
+	esac
+}
+
 # sing-box должен подняться после reload и НЕ упасть сразу: считаем его живым,
 # только когда три проверки подряд (с интервалом в секунду) видят один и тот же
 # процесс. Иначе procd-перезапуск падающего sing-box выглядел бы как успех.
@@ -836,10 +854,12 @@ cmd_status() {
 	local running="false" lpid
 	lpid=$(cat "$LOCK/pid" 2>/dev/null)
 	[ -n "$lpid" ] && kill -0 "$lpid" 2>/dev/null && running="true"
-	local hasp="true"
+	local hasp="true" route=""
 	podkop_installed || hasp="false"
-	printf '{"running":%s,"podkop":%s,"version":"%s","status":"%s","message":"%s","last_update":%s,"count":%s,"sub":%s,"manual":%s,"section":"%s","nodes":[%s]}\n' \
-		"$running" "$hasp" "$VERSION-$([ "$RELEASE" = dev ] && echo dev || echo "r$RELEASE")" \
+	# пока идёт синхронизация, podkop перезапускается — состояние покажем по её окончании
+	[ "$running" = "true" ] || route="$(route_state)"
+	printf '{"running":%s,"podkop":%s,"route":"%s","version":"%s","status":"%s","message":"%s","last_update":%s,"count":%s,"sub":%s,"manual":%s,"section":"%s","nodes":[%s]}\n' \
+		"$running" "$hasp" "$route" "$VERSION-$([ "$RELEASE" = dev ] && echo dev || echo "r$RELEASE")" \
 		"$(printf '%s' "$st" | json_escape)" \
 		"$(printf '%s' "$ms" | json_escape)" \
 		"${up:-0}" "$cnt" "${sub:-0}" "${man:-0}" "$(printf '%s' "$SECTION" | json_escape)" \

@@ -783,7 +783,7 @@ class ChosenSniTests(SyncEnv):
         self.assertIn("sni=api.example.ru", self.links()[0])
         self.assertEqual(self.links()[1], N2, "вторая нода не менялась — её не трогаем")
         self.assertEqual(self.reloads(), 2)
-        self.assertIn("приняты новые SNI с сервера: 1", self.status()[1])
+        self.assertIn("приняты новые параметры с сервера: 1", self.status()[1])
         self.assertEqual(self.sync(), 0)                           # дальше тихо
         self.assertEqual(self.reloads(), 2)
         self.assertIn("Без изменений", self.status()[1])

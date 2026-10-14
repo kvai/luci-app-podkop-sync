@@ -336,5 +336,41 @@ k27 = ps.apply_sticky(f27, ["vless://u-1@h1.example:443?pbk=K1&security=reality&
 check("consensus: already on the chosen sni -> stays sticky (short id kept)", k27 == 1 and "sid=s0" in ps.render_links(f27)[0])
 
 print()
+# JSON-подписка 3x-ui: «плоская» форма VLESS (адрес, порт и id прямо в settings, без vnext),
+# первым идёт профиль-балансировщик со всеми серверами, дальше каждый сервер отдельно.
+def _flat(tag, host, sni):
+    return {"protocol": "vless", "tag": tag,
+            "settings": {"address": host, "port": 443, "id": "11111111-2222-4333-8444-555555555555",
+                         "encryption": "none", "flow": "xtls-rprx-vision", "level": 8},
+            "streamSettings": {"network": "tcp", "security": "reality",
+                               "realitySettings": {"fingerprint": "firefox", "mldsa65Verify": "", "show": False,
+                                                   "publicKey": "PBKPBKPBKPBKPBKPBKPBKPBKPBKPBKPBKPBKPBKPBKP",
+                                                   "serverName": sni, "shortId": "abcd1234", "spiderX": "/x"},
+                               "tcpSettings": {"header": {"type": "none"}}}}
+
+XUI = [
+    {"remarks": "Авто | Лучший сервер", "burstObservatory": {}, "routing": {"balancers": [{"tag": "balancer"}]},
+     "outbounds": [_flat("bal-1-vless", "se.example.net", "www.example.com"),
+                   _flat("bal-1-vless-2", "de.example.net", "api.example.org"),
+                   {"protocol": "freedom", "tag": "direct"}]},
+    {"remarks": "Швеция", "outbounds": [_flat("proxy", "se.example.net", "www.example.com"),
+                                         {"protocol": "freedom", "tag": "direct"}]},
+    {"remarks": "Франкфурт", "outbounds": [_flat("proxy", "de.example.net", "api.example.org")]},
+]
+xui_nodes = ps.nodes_from_json(XUI)
+check("3x-ui json: flat vless is parsed", len(xui_nodes) == 4, str(len(xui_nodes)))
+xui_links = ps.render_links(xui_nodes)
+check("3x-ui json: balancer copies collapse to one link per server", len(xui_links) == 2, str(xui_links))
+check("3x-ui json: names come from single-server profiles, not from the balancer",
+      any(l.endswith("#" + ps.encode_fragment("Швеция")) for l in xui_links)
+      and any(l.endswith("#" + ps.encode_fragment("Франкфурт")) for l in xui_links), str(xui_links))
+check("3x-ui json: flow, key, sni and short id survive",
+      all("flow=xtls-rprx-vision" in l and "pbk=PBK" in l and "sid=abcd1234" in l and "fp=firefox" in l for l in xui_links)
+      and any("sni=www.example.com" in l for l in xui_links), str(xui_links))
+check("3x-ui json: garbage in settings does not crash",
+      ps.nodes_from_json({"remarks": "x", "outbounds": [{"protocol": "vless", "settings": {"vnext": ["oops"]}},
+                                                         {"protocol": "vless", "settings": None},
+                                                         {"protocol": "vless", "settings": {"address": "", "id": "x"}}]}) == [])
+
 print("FAILURES:", failures)
 sys.exit(1 if failures else 0)

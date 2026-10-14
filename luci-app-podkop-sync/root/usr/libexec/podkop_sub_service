@@ -15,7 +15,7 @@
 ROOT="${PODKOP_SUB_ROOT:-}"
 # Версия плагина (показывается в LuCI). Должна совпадать с PKG_VERSION в
 # Makefile — за этим следит tests/test_sync.py.
-VERSION="1.2.1"
+VERSION="1.2.2"
 # Номер сборки: GitHub Actions подставляет сюда и в PKG_RELEASE порядковый номер
 # запуска, чтобы каждая сборка была «новее» предыдущей и opkg обновлял пакет
 # поверх без удаления. «dev» — файлы выложены вручную (dev-deploy.sh).
@@ -482,7 +482,7 @@ do_sync() {
 		[ "$stuck" -gt 0 ] && summary="$summary · SNI/short id сохранены у работающих: $stuck"
 		[ -n "$trnote" ] && summary="$summary · не поддерживаются podkop и пропущены: $trnote"
 		[ "$deadn" -gt 0 ] && summary="$summary · не отвечают: $deadn"
-		[ "$newsni" -gt 0 ] && summary="$summary · приняты новые SNI с сервера: $newsni"
+		[ "$newsni" -gt 0 ] && summary="$summary · приняты новые параметры с сервера: $newsni"
 	fi
 	# статус warn, если секция не в режиме URLTest
 	local slvl="ok"

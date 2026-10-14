@@ -175,16 +175,23 @@ def node_from_outbound(outbound, raw_remark):
     if outbound.get("protocol") != "vless":
         return None
 
-    vnext = outbound.get("settings", {}).get("vnext", [])
-    if not vnext:
+    # Сервер описывают двумя способами: классическим (settings.vnext[0] с users[0])
+    # и «плоским» — адрес, порт и id прямо в settings. Плоский отдаёт, например,
+    # JSON-подписка 3x-ui; без него такая подписка давала ноль нод.
+    settings = outbound.get("settings") or {}
+    vnext = settings.get("vnext") or []
+    if vnext:
+        server = vnext[0] if isinstance(vnext[0], dict) else {}
+        user = (server.get("users") or [{}])[0]
+    else:
+        server = user = settings
+    if not isinstance(user, dict):
         return None
-    server = vnext[0]
     address = server.get("address")
     port = server.get("port", 443)
     if not address:
         return None
 
-    user = (server.get("users") or [{}])[0]
     uuid = user.get("id")
     if not uuid:
         return None
